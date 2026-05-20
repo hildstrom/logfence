@@ -1,0 +1,5 @@
+# systemd-sysusers drop-in: creates the logfence system user and group.
+# Install to /usr/lib/sysusers.d/logfenced.conf
+#
+# Type  Name      ID   GECOS            Home  Shell
+u       logfence  -    "logfence daemon" -     -

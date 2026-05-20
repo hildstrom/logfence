@@ -1,0 +1,198 @@
+@startuml key-types
+title logfence — Key Types
+
+skinparam defaultFontName Monospaced
+skinparam classBackgroundColor #FAFAFA
+skinparam classBorderColor #888888
+skinparam ArrowColor #444444
+skinparam BackgroundColor #FAFAFA
+hide empty members
+
+' ── logfence-proto ────────────────────────────────────────────
+
+package "logfence-proto" #DDEEFF {
+
+  class SyslogMessage {
+    + priority: Priority
+    + timestamp: Option<String>
+    + hostname: Option<String>
+    + app_name: Option<String>
+    + proc_id: Option<String>
+    + msg_id: Option<String>
+    + structured_data: Option<String>
+    + msg: String
+    --
+    + parse(input: &str) -> Result<Self>
+    + Display (RFC 5424 wire format)
+  }
+
+  class Priority {
+    + facility: Facility
+    + severity: Severity
+    --
+    + as_u8() -> u8
+  }
+
+  enum Facility {
+    Kern, User, Mail, Daemon
+    Auth, Syslog, Lpr, News
+    Uucp, Cron, ..., Local0-Local7
+  }
+
+  enum Severity {
+    Emergency, Alert, Critical
+    Error, Warning, Notice
+    Info, Debug
+  }
+
+  class OctetCountCodec {
+    - max_size: usize
+    --
+    + new(max_size) -> Self
+    + Decoder<Item=SyslogMessage>
+    + Encoder<Item=SyslogMessage>
+  }
+
+  class DelimiterCodec {
+    - delimiter: u8
+    - max_size: usize
+    --
+    + newline(max_size) -> Self
+    + Decoder<Item=SyslogMessage>
+    + Encoder<Item=SyslogMessage>
+  }
+
+  SyslogMessage *-- Priority
+  Priority *-- Facility
+  Priority *-- Severity
+}
+
+' ── logfence-client ───────────────────────────────────────────
+
+package "logfence-client" #DDFFD0 {
+
+  class MessageBuilder {
+    - facility: Facility
+    - severity: Severity
+    - fields: BTreeMap<String, Value>
+    - cee: bool
+    - (header fields...)
+    --
+    + new(Facility, Severity) -> Self
+    + kv(key, val) -> Result<Self>
+    + cee_cookie(bool) -> Self
+    + app_name(String) -> Self
+    + msgid(String) -> Self
+    + build() -> Result<SyslogMessage>
+    + send(transport) -> Result<()>
+  }
+
+  class UnixTransport {
+    - path: PathBuf
+    - max_size: usize
+    - stream: Mutex<Option<UnixStream>>
+    --
+    + new(path, max_size) -> Self
+    + send(msg) -> Result<()>
+  }
+
+  interface Transport <<trait>> {
+    + send(msg: &SyslogMessage) -> Result<()>
+  }
+
+  MessageBuilder ..> SyslogMessage : builds
+  UnixTransport ..|> Transport
+  MessageBuilder ..> Transport : .send()
+}
+
+' ── logfence-daemon ───────────────────────────────────────────
+
+package "logfence-daemon" #FFEECC {
+
+  class Validator {
+    - mode: ValidationMode
+    - schemas: Vec<JsonSchemaValidator>
+    - discriminator: Option<DiscriminatorMap>
+    - input_cee: CeeCookieMode
+    - output_cee: CeeCookieMode
+    - canonical_json: bool
+    --
+    + new(mode, schemas) -> Self
+    + with_input_cee(mode) -> Self
+    + with_output_cee(mode) -> Self
+    + with_canonical_json(bool) -> Self
+    + with_discriminator_docs(...) -> Result<Self>
+    + validate(msg) -> Result<(), ValidationError>
+    + prepare_for_forwarding(msg) -> Cow<SyslogMessage>
+  }
+
+  class DiscriminatorMap {
+    - field: String
+    - map: HashMap<String, JsonSchemaValidator>
+  }
+
+  enum ValidationMode {
+    Strict
+    Warn
+    Off
+  }
+
+  enum CeeCookieMode {
+    Never
+    Optional
+    Always
+  }
+
+  class Forwarder {
+    - inner: Arc<Inner>
+    --
+    + from_config(cfg) -> Result<Self>
+    + forward(msg) -> Result<()>
+  }
+
+  class "Inner (UnixDgram)" as InnerDgram {
+    - socket: UnixDatagram
+    - path: String
+  }
+
+  class "Inner (UnixStream)" as InnerStream {
+    - path: String
+    - stream: Mutex<Option<UnixStream>>
+  }
+
+  class MetricsStore {
+    - received: AtomicU64
+    - forwarded: AtomicU64
+    - dropped: AtomicU64
+    - errors: AtomicU64
+    --
+    + new() -> Arc<Self>
+    + inc_received()
+    + inc_forwarded()
+    + inc_dropped()
+    + inc_errors()
+    + snapshot() -> Snapshot
+  }
+
+  class Snapshot {
+    + received: u64
+    + forwarded: u64
+    + dropped: u64
+    + errors: u64
+  }
+
+  Validator *-- ValidationMode
+  Validator *-- CeeCookieMode
+  Validator *-- DiscriminatorMap
+  Forwarder *-- InnerDgram
+  Forwarder *-- InnerStream
+  MetricsStore ..> Snapshot : produces
+}
+
+' ── Cross-crate usage ─────────────────────────────────────────
+
+Validator ..> SyslogMessage : validates
+Forwarder ..> SyslogMessage : forwards
+UnixTransport ..> OctetCountCodec : uses for framing
+
+@enduml

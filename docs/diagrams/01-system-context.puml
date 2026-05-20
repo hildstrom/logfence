@@ -1,0 +1,46 @@
+@startuml system-context
+title logfence — System Context
+
+skinparam defaultFontName Monospaced
+skinparam componentStyle rectangle
+skinparam ArrowColor #444444
+skinparam BackgroundColor #FAFAFA
+skinparam ComponentBackgroundColor #DDEEFF
+skinparam DatabaseBackgroundColor #DDFFD0
+skinparam ActorBackgroundColor #FFEECC
+
+actor "Application\n(any language)" as App
+component "logfence-client\n(Rust library)" as Client
+component "logfenced\n(daemon)" as Daemon
+component "rsyslog" as Rsyslog
+database "JSON Schema\nfiles" as Schemas
+component "Log Storage /\nNetwork Targets" as Storage
+
+App --> Client : calls MessageBuilder API
+Client --> Daemon : RFC 5424 + JSON payload\nUnix stream socket\nOctet-count framing
+Daemon ..> Schemas : reads at startup\n& on SIGHUP
+Daemon --> Rsyslog : validated messages\nUnix datagram or stream socket\nRFC 5424 wire format
+Rsyslog --> Storage : forwards to files,\nnetwork, etc.
+
+note right of Client
+  Encodes syslog header fields
+  Serializes key-value pairs to JSON
+  Lazily connects; auto-reconnects
+end note
+
+note right of Daemon
+  Validates JSON payload
+  Enforces JSON Schema
+  Applies CEE cookie policy
+  Canonicalizes JSON (optional)
+  Drops invalid messages
+end note
+
+note bottom of Daemon
+  Invalid messages are dropped
+  and an error is reported to
+  rsyslog — they never reach
+  downstream consumers.
+end note
+
+@enduml

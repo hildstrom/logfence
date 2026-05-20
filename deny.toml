@@ -1,0 +1,34 @@
+[graph]
+# Only check the default feature set.
+all-features = false
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+# Allow common permissive licenses only.
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+[bans]
+# Deny multiple versions of the same crate (helps keep the dependency tree lean).
+multiple-versions = "warn"
+# Deny wildcard dependencies (path-only workspace members are exempt).
+wildcards = "allow"
+
+[sources]
+# Only allow crates from crates.io.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,0 +1,73 @@
+@startuml sighup-reload
+title logfence — SIGHUP Hot Reload Sequence
+
+skinparam defaultFontName Monospaced
+skinparam sequenceArrowThickness 1.5
+skinparam BackgroundColor #FAFAFA
+skinparam noteBorderColor #AAAAAA
+
+actor "Operator" as Ops
+participant "Signal Handler\n(main.rs)" as Signals
+participant "Config Loader\n(config.rs)" as Config
+participant "Validator Builder\n(main.rs)" as Builder
+participant "watch::Sender\n(main.rs)" as Sender
+participant "Session A\n(active)" as SessionA
+participant "Session B\n(active)" as SessionB
+
+note over SessionA, SessionB
+  Both sessions are mid-stream,
+  processing messages concurrently.
+  Each holds a watch::Receiver clone.
+end note
+
+Ops -> Signals : kill -HUP <pid>
+
+Signals -> Config : load config file from disk
+Config --> Signals : Config { validation: ... }
+
+Signals -> Builder : load_schema_files(cfg.validation)
+Builder -> Builder : read JSON schema files\ncompile with jsonschema
+Builder --> Signals : Vec<JsonSchemaValidator>
+
+Signals -> Builder : build_validator(cfg.validation, schemas)
+Builder --> Signals : Arc<Validator> (new)
+
+Signals -> Sender : validator_tx.send(Arc<new_validator>)
+note right of Sender
+  watch channel update is
+  atomic and lock-free.
+  No connections dropped.
+end note
+
+note over SessionA, SessionB
+  Sessions continue processing
+  in-flight messages with the
+  old validator until the next
+  message boundary.
+end note
+
+SessionA -> SessionA : finish current message\nwith old Validator
+
+SessionA -> Sender : borrow() — picks up\nnew Arc<Validator>
+note right of SessionA
+  Clone Arc from borrow(),
+  release borrow lock before
+  any await point.
+end note
+SessionA -> SessionA : process next message\nwith new Validator
+
+SessionB -> SessionB : finish current message\nwith old Validator
+SessionB -> Sender : borrow() — picks up\nnew Arc<Validator>
+SessionB -> SessionB : process next message\nwith new Validator
+
+note over SessionA, SessionB
+  Zero downtime:
+  - No connections dropped
+  - No messages lost
+  - New schema takes effect
+    at next message boundary
+  - Old Arc dropped when
+    last session releases it
+end note
+
+@enduml

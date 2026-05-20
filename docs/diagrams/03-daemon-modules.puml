@@ -1,0 +1,50 @@
+@startuml daemon-modules
+title logfenced — Internal Module Organisation
+
+skinparam defaultFontName Monospaced
+skinparam componentStyle rectangle
+skinparam ArrowColor #444444
+skinparam BackgroundColor #FAFAFA
+
+component "main.rs\n──────────────\nCLI parsing (clap)\nConfig loading\nLogging init\nSignal handling\n(SIGTERM/SIGHUP/SIGUSR1)\nStartup orchestration" as Main #FFEECC
+
+component "config.rs\n──────────────\nDaemonConfig\nRsyslogConfig\nValidationConfig\nLoggingConfig\nMetricsConfig\nTOML deserialization\nConfig validation" as Config #DDEEFF
+
+component "validator.rs\n──────────────\nValidator struct\nValidationMode\nCeeCookieMode\nDiscriminatorMap\njsonschema compilation\nJSON parse + schema check\nCEE cookie strip/add\nCanonical JSON output\nprepare_for_forwarding()" as Validator #DDFFD0
+
+component "forwarder.rs\n──────────────\nForwarder (Arc<Inner>)\nInner::UnixDgram\nInner::UnixStream\nRFC 5424 wire render\nAuto-reconnect" as Forwarder #FFD0D0
+
+component "listener.rs\n──────────────\nUnixListener bind\nSocket permissions\nSemaphore (max_connections)\nAccept loop\nGraceful drain on shutdown" as Listener #FFFACC
+
+component "session.rs\n──────────────\nPer-connection loop\nOctetCountCodec decode\nDelimiterCodec decode\nValidator clone from watch\nForward on success\nMetrics increment" as Session #E8D0FF
+
+component "metrics.rs\n──────────────\nMetricsStore (Arc)\nAtomicU64 counters:\n  received / forwarded\n  dropped / errors\nSnapshot serialization\nStats socket (feature)" as Metrics #D0F0FF
+
+Main --> Config : load & validate
+Main --> Validator : build from config\nwrap in Arc<Validator>
+Main --> Forwarder : build from RsyslogConfig
+Main --> Listener : bind socket\nstart accept loop
+Main --> Metrics : create Arc<MetricsStore>
+Main --> Session : via watch::channel\n(validator updates)
+
+Listener --> Session : spawn task\nper accepted connection\n(semaphore-gated)
+
+Session --> Validator : clone Arc from\nwatch::Receiver
+Session --> Forwarder : forward() per\nvalid message
+Session --> Metrics : inc_received()\ninc_forwarded()\ninc_dropped()\ninc_errors()
+
+note right of Main
+  Signal wiring:
+  SIGTERM  → shutdown.cancel()
+  SIGHUP   → reload validator,
+             validator_tx.send()
+  SIGUSR1  → log metrics snapshot
+end note
+
+note bottom of Session
+  One Tokio task per connection.
+  Semaphore permit held for
+  connection lifetime.
+end note
+
+@enduml

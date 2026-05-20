@@ -1,0 +1,123 @@
+@startuml message-sequence
+title logfence — Message Lifecycle Sequence
+
+skinparam defaultFontName Monospaced
+skinparam sequenceArrowThickness 1.5
+skinparam sequenceParticipantBackgroundColor #FAFAFA
+skinparam sequenceLifeLineBorderColor #888888
+skinparam BackgroundColor #FAFAFA
+skinparam noteBorderColor #AAAAAA
+
+actor "Application" as App
+participant "MessageBuilder\n(logfence-client)" as Builder
+participant "UnixTransport\n(logfence-client)" as Transport
+participant "Listener\n(logfenced)" as Listener
+participant "Session Task\n(logfenced)" as Session
+participant "OctetCountCodec\n(logfence-proto)" as Codec
+participant "Validator\n(logfenced)" as Validator
+participant "Forwarder\n(logfenced)" as Forwarder
+participant "MetricsStore\n(logfenced)" as Metrics
+participant "rsyslog" as Rsyslog
+
+== Application builds and sends a message ==
+
+App -> Builder : MessageBuilder::new(Local0, Info)\n.kv("event", "user_login")\n.kv("user", "alice")\n.send(&transport)
+
+Builder -> Builder : serialize BTreeMap → JSON\n{"event":"user_login","user":"alice"}
+Builder -> Builder : build SyslogMessage\n(RFC 5424 header + JSON msg)
+
+Builder -> Transport : send(&msg)
+Transport -> Transport : render msg → wire format\n"<190>1 2026-05-14T... host app - - {...}"
+Transport -> Transport : prepend octet count\n"43 <190>1 2026-05-14T..."
+
+Transport -> Listener : write_all(frame)\n[Unix stream socket]
+
+== Daemon accepts and reads the connection ==
+
+Listener -> Listener : acquire semaphore permit\n(blocks if at max_connections)
+Listener -> Session : spawn session task\n(Arc<Validator>, Forwarder, Metrics)
+
+Session -> Codec : read_buf() → decode()
+Codec -> Codec : parse octet-count prefix\nread exactly N bytes\nparse as RFC 5424
+Codec --> Session : Ok(SyslogMessage)
+
+Session -> Metrics : inc_received()
+
+== Validation ==
+
+Session -> Validator : clone Arc<Validator>\nfrom watch::Receiver\n(releases lock immediately)
+
+Session -> Validator : validate(&msg)
+
+alt input_cee = Optional or Always
+  Validator -> Validator : strip "@cee:" prefix\n(if present)
+end
+
+Validator -> Validator : serde_json::from_str(msg.msg)
+Validator -> Validator : verify is_object()
+
+alt discriminator field configured
+  Validator -> Validator : extract discriminator field value\n(e.g. msg["service"] = "api-gateway")
+  Validator -> Validator : O(1) map lookup → schema
+else no discriminator or value not in map
+  Validator -> Validator : linear scan schemas[]\n(first match wins)
+end
+
+alt mode = Strict and no schema matched
+  Validator --> Session : Err(SchemaRejected)
+  Session -> Metrics : inc_dropped()
+  note right of Session : message discarded;\nno forwarding
+else mode = Warn and no schema matched
+  Validator -> Validator : log warning
+  Validator --> Session : Ok(())
+else mode = Off or schema matched
+  Validator --> Session : Ok(())
+end
+
+== Prepare for forwarding ==
+
+Session -> Validator : prepare_for_forwarding(&msg)
+
+alt canonical_json = true
+  Validator -> Validator : parse JSON\nrecursively sort object keys\nre-serialize compact JSON
+end
+
+alt output_cee = Never
+  Validator -> Validator : strip "@cee:" if present
+else output_cee = Always
+  Validator -> Validator : prepend "@cee:" if absent
+else output_cee = Optional
+  Validator -> Validator : forward msg unchanged
+end
+
+alt no transformation needed
+  Validator --> Session : Cow::Borrowed(&msg)
+else transformation applied
+  Validator --> Session : Cow::Owned(new_msg)
+end
+
+== Forward to rsyslog ==
+
+Session -> Forwarder : forward(&prepared_msg)
+Forwarder -> Forwarder : render msg → RFC 5424 wire format
+
+alt transport = unix_dgram (default)
+  Forwarder -> Rsyslog : socket.send_to(bytes, path)\n[Unix datagram socket]
+else transport = unix_stream
+  Forwarder -> Forwarder : prepend octet count
+  Forwarder -> Rsyslog : write_all(frame)\n[Unix stream socket,\nauto-reconnect on error]
+end
+
+alt forward succeeded
+  Forwarder --> Session : Ok(())
+  Session -> Metrics : inc_forwarded()
+else forward failed
+  Forwarder --> Session : Err(ForwardError)
+  Session -> Metrics : inc_errors()
+end
+
+== Session continues reading until EOF ==
+
+Session -> Codec : read next message...
+
+@enduml

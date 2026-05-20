@@ -1,0 +1,47 @@
+[package]
+name = "logfence-daemon"
+description = "Validating syslog filter daemon — forwards valid JSON messages to rsyslog"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "logfenced"
+path = "src/main.rs"
+
+[features]
+## Enables the Unix socket stats endpoint (`metrics.socket`).
+## When active, `logfenced` binds an additional socket and writes a JSON
+## metrics snapshot to each connecting client.
+metrics = []
+
+[dependencies]
+logfence-proto = { path = "../logfence-proto" }
+bytes = { workspace = true }
+clap = { workspace = true }
+jsonschema = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
+tokio-util = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+criterion         = { version = "0.8.2", features = ["html_reports"] }
+logfence-client   = { path = "../logfence-client" }
+logfence-client-c = { path = "../logfence-client-c" }
+socket2           = "0.6.3"
+tempfile          = "3.27.0"
+tokio             = { workspace = true, features = ["time"] }
+
+[[bench]]
+name = "message_throughput"
+harness = false
+
+[lints]
+workspace = true

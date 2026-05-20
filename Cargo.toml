@@ -1,0 +1,73 @@
+[workspace]
+members = [
+    "crates/logfence-proto",
+    "crates/logfence-client",
+    "crates/logfence-client-c",
+    "crates/logfence-daemon",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.86"
+license = "Apache-2.0"
+repository = "https://github.com/example/logfence"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.52.3", features = ["net", "io-util", "sync", "rt-multi-thread", "macros", "signal"] }
+
+# Serialization
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+
+# Config parsing
+toml = "1.1.2"
+
+# JSON Schema validation
+jsonschema = { version = "0.46.5", default-features = false }
+
+# Error handling
+thiserror = "2.0.18"
+
+# Tracing (daemon-internal observability, separate from the syslog pipe)
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+# CLI argument parsing
+clap = { version = "4.6.1", features = ["derive"] }
+
+# Zero-copy byte buffers
+bytes = "1.11.1"
+
+# Tokio codec utilities (Decoder / Encoder traits)
+tokio-util = { version = "0.7.18", features = ["codec"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Panic prevention
+unwrap_used = "deny"
+expect_used = "warn"
+panic = "deny"
+panic_in_result_fn = "deny"
+unimplemented = "deny"
+# Suppress-lint guard: warn when #[allow(...)] is used without a reason comment.
+# Set to "warn" rather than "deny" so test modules can allow(unwrap_used) etc.
+allow_attributes_without_reason = "warn"
+# Code hygiene
+dbg_macro = "deny"
+todo = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+# Safety
+await_holding_lock = "deny"
+large_futures = "deny"
+exit = "deny"
+mem_forget = "deny"
+# Pedantic relaxations (too noisy for this codebase)
+module_name_repetitions = "allow"
+similar_names = "allow"

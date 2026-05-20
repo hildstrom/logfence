@@ -1,0 +1,25 @@
+[Unit]
+Description=logfence validating syslog filter daemon
+Documentation=https://github.com/example/logfence
+After=network.target syslog.target
+Requires=syslog.socket
+
+[Service]
+Type=simple
+User=logfence
+Group=logfence
+ExecStart=/usr/local/bin/logfenced --config /etc/logfenced/logfenced.toml
+Restart=on-failure
+RestartSec=5s
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/run/logfenced
+RuntimeDirectory=logfenced
+RuntimeDirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target

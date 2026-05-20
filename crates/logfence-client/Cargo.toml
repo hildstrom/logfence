@@ -1,0 +1,22 @@
+[package]
+name = "logfence-client"
+description = "Client library for sending structured syslog messages to logfenced or rsyslog"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+logfence-proto = { path = "../logfence-proto" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { workspace = true, features = ["time"] }
+
+[lints]
+workspace = true

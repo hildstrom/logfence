@@ -1,0 +1,92 @@
+@startuml concurrency-model
+title logfence — Concurrency Model
+
+skinparam defaultFontName Monospaced
+skinparam componentStyle rectangle
+skinparam ArrowColor #444444
+skinparam BackgroundColor #FAFAFA
+skinparam noteBorderColor #AAAAAA
+
+rectangle "Tokio Runtime" {
+
+  component "main task\n──────────────\nOrchestration\nSignal handler" as Main #FFEECC
+
+  component "Semaphore\n(max_connections permits)" as Sema #FFFACC
+
+  component "watch::channel\nSender: Arc<Validator>\n──────────────\nHolds latest validator;\nupdated on SIGHUP" as Watch #DDFFD0
+
+  component "CancellationToken\n(shutdown)" as Cancel #FFD0D0
+
+  component "Arc<MetricsStore>\n──────────────\nreceived  AtomicU64\nforwarded AtomicU64\ndropped   AtomicU64\nerrors    AtomicU64" as Metrics #D0F0FF
+
+  rectangle "listener task" {
+    component "UnixListener\naccept loop" as AcceptLoop #DDEEFF
+  }
+
+  rectangle "session task N" as S1 {
+    component "watch::Receiver\nArc<Validator> clone\n──────────────\nPer-message borrow;\nlock released before await" as WatchRx1 #DDFFD0
+    component "Codec\n(OctetCount or Delimiter)" as Codec1 #E8D0FF
+  }
+
+  rectangle "session task ..." as S2 {
+    component "watch::Receiver\nArc<Validator> clone" as WatchRx2 #DDFFD0
+    component "Codec" as Codec2 #E8D0FF
+  }
+
+  component "metrics socket task\n(optional feature)\n──────────────\nServes JSON snapshot\nper connecting client" as MetricsSock #D0F0FF
+
+}
+
+component "Arc<Forwarder>\n(shared across sessions)\n──────────────\nUnixDgram: stateless\nUnixStream: Mutex<Option<stream>>" as Forwarder #FFD0D0
+
+Main --> Watch : SIGHUP → send(Arc<new_validator>)
+Main --> Cancel : SIGTERM → cancel()
+Main --> Metrics : SIGUSR1 → log snapshot()
+
+Cancel --> AcceptLoop : cancelled() → stop accepting
+Cancel --> MetricsSock : cancelled() → stop serving
+
+AcceptLoop --> Sema : acquire permit\n(per connection)
+AcceptLoop --> S1 : spawn with permit
+AcceptLoop --> S2 : spawn with permit
+
+S1 --> Sema : drop permit on EOF\nor disconnect
+S2 --> Sema : drop permit on EOF\nor disconnect
+
+WatchRx1 --> Watch : borrow() → clone Arc
+WatchRx2 --> Watch : borrow() → clone Arc
+
+Codec1 --> Forwarder : forward() on valid msg
+Codec2 --> Forwarder : forward() on valid msg
+
+Codec1 --> Metrics : inc_received()\ninc_forwarded()\ninc_dropped()\ninc_errors()
+Codec2 --> Metrics : (same)
+
+MetricsSock --> Metrics : snapshot()
+
+note bottom of Forwarder
+  UnixStream variant uses
+  Mutex<Option<UnixStream>> for
+  lazy-connect / auto-reconnect.
+  Lock held only during write.
+end note
+
+note right of Watch
+  Arc<Validator> refcount:
+  - 1 in watch Sender
+  - 1 per active session
+    (dropped after each message)
+  Old Validator freed when
+  last session releases it.
+end note
+
+note right of Sema
+  Backpressure: accept()
+  blocks until a permit is
+  available when all
+  max_connections are active.
+  On SIGTERM: wait up to 30 s
+  for all permits to return.
+end note
+
+@enduml

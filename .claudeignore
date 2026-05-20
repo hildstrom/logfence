@@ -1,0 +1,3 @@
+*.claude.txt
+/target/
+.DS_Store

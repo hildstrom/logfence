@@ -1,0 +1,128 @@
+@startuml validation-pipeline
+title logfence — Validation and Forwarding Pipeline
+
+skinparam defaultFontName Monospaced
+skinparam BackgroundColor #FAFAFA
+skinparam ActivityBackgroundColor #DDEEFF
+skinparam ActivityBorderColor #888888
+skinparam ArrowColor #444444
+skinparam DiamondBackgroundColor #FFEECC
+skinparam noteBorderColor #AAAAAA
+
+start
+
+:Receive decoded SyslogMessage from codec;
+:inc_received();
+
+' ── CEE input check ──────────────────────────────────────────
+
+if (input_cee = Never?) then (yes)
+  if (msg starts with "@cee:"?) then (yes)
+    :ValidationError::UnexpectedCeeCookie;
+    :inc_dropped();
+    stop
+  endif
+elseif (input_cee = Always?) then (yes)
+  if (msg does NOT start with "@cee:"?) then (yes)
+    :ValidationError::MissingCeeCookie;
+    :inc_dropped();
+    stop
+  else (no — cookie present)
+    :strip "@cee:" prefix\n(before JSON parse);
+  endif
+else (Optional)
+  if (msg starts with "@cee:"?) then (yes)
+    :strip "@cee:" prefix\n(before JSON parse);
+  endif
+endif
+
+' ── JSON parse ───────────────────────────────────────────────
+
+:serde_json::from_str(bare_json);
+
+if (parse succeeded?) then (no)
+  :ValidationError::InvalidJson;
+  :inc_dropped();
+  stop
+endif
+
+if (value.is_object()?) then (no)
+  :ValidationError::NotAnObject;
+  :inc_dropped();
+  stop
+endif
+
+' ── Schema matching ──────────────────────────────────────────
+
+if (mode = Off?) then (yes)
+  :skip schema check;
+else (Strict or Warn)
+  if (no schemas configured\nand no discriminator?) then (yes)
+    :accept (any JSON object);
+  else (schemas configured)
+    if (discriminator field configured\nand field present in msg?) then (yes)
+      :O(1) map lookup\nby field value;
+      if (schema found in map?) then (yes)
+        :validate against\nmapped schema;
+      else (not in map)
+        :fall through to\nlinear scan;
+      endif
+    endif
+
+    if (no schema matched yet?) then (yes)
+      :linear scan schemas[]\n(first match wins);
+    endif
+
+    if (any schema matched?) then (no)
+      if (mode = Strict?) then (yes)
+        :ValidationError::SchemaRejected;
+        :inc_dropped();
+        stop
+      else (Warn)
+        :log schema mismatch warning;
+      endif
+    endif
+  endif
+endif
+
+' ── Prepare for forwarding ───────────────────────────────────
+
+note right
+  prepare_for_forwarding()
+  returns Cow::Borrowed when
+  no transformation is needed
+  (zero allocation).
+end note
+
+if (canonical_json = true?) then (yes)
+  :parse JSON;
+  :recursively sort all\nobject keys (BTreeMap);
+  :re-serialize compact JSON;
+endif
+
+if (output_cee = Never?) then (yes)
+  :strip "@cee:" if present;
+elseif (output_cee = Always?) then (yes)
+  :prepend "@cee:" if absent;
+else (Optional)
+  :preserve msg unchanged;
+endif
+
+' ── Forward ──────────────────────────────────────────────────
+
+:Forwarder::forward(prepared_msg);
+
+if (forward succeeded?) then (yes)
+  :inc_forwarded();
+else (no)
+  :inc_errors();
+  note right
+    Message passed validation
+    but could not be delivered
+    (rsyslog unreachable, etc.)
+  end note
+endif
+
+stop
+
+@enduml

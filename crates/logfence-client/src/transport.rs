@@ -1,0 +1,201 @@
+//! Transport trait and implementation for delivering syslog messages.
+//!
+//! One transport is provided:
+//!
+//! - [`UnixTransport`] — connects to a Unix stream socket and sends messages
+//!   using RFC 6587 §3.4.1 octet-count framing. This is the correct transport
+//!   for talking to a running `logfenced` daemon or to rsyslog's `imuxsock`.
+//!   The connection is established lazily on first send and re-established
+//!   automatically after any I/O error.
+
+use std::path::PathBuf;
+
+use tokio::{io::AsyncWriteExt, net::UnixStream, sync::Mutex};
+
+use logfence_proto::syslog::SyslogMessage;
+
+use crate::error::ClientError;
+
+// ── Transport trait ───────────────────────────────────────────────────────────
+
+/// Deliver a [`SyslogMessage`] to a syslog endpoint.
+///
+/// Implementors must be `Send + Sync` so they can be shared across Tokio tasks.
+/// The default implementation ([`UnixTransport`]) handles connection management
+/// internally.
+#[allow(
+    async_fn_in_trait,
+    reason = "Transport is only implemented within this crate; \
+              the implementation produces Send futures due to its Send-safe state"
+)]
+pub trait Transport: Send + Sync {
+    /// Send a single syslog message.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Io`] on I/O failure or
+    /// [`ClientError::MessageTooLarge`] if the rendered message exceeds the
+    /// transport's configured size limit.
+    async fn send(&self, msg: &SyslogMessage) -> Result<(), ClientError>;
+}
+
+// ── UnixTransport ─────────────────────────────────────────────────────────────
+
+/// RFC 6587 §3.4.1 octet-count framing over a Unix stream socket.
+///
+/// Connects lazily on the first [`send`](Transport::send) call. If the
+/// connection is lost, the next `send` re-establishes it automatically.
+///
+/// Thread-safe: the socket is protected by a [`tokio::sync::Mutex`].
+pub struct UnixTransport {
+    path: PathBuf,
+    max_size: usize,
+    stream: Mutex<Option<UnixStream>>,
+}
+
+impl UnixTransport {
+    /// Create a transport that will connect to the Unix socket at `path`.
+    ///
+    /// `max_size` is the maximum accepted wire message size in bytes.
+    /// Use `65536` for the logfenced default.
+    #[must_use]
+    pub fn new(path: impl Into<PathBuf>, max_size: usize) -> Self {
+        Self {
+            path: path.into(),
+            max_size,
+            stream: Mutex::new(None),
+        }
+    }
+}
+
+impl Transport for UnixTransport {
+    async fn send(&self, msg: &SyslogMessage) -> Result<(), ClientError> {
+        let wire = msg.to_string();
+        if wire.len() > self.max_size {
+            return Err(ClientError::MessageTooLarge {
+                max: self.max_size,
+                got: wire.len(),
+            });
+        }
+        // RFC 6587 §3.4.1: prepend "<byte-count> " before the message.
+        let frame = format!("{} {wire}", wire.len());
+        let frame_bytes = frame.as_bytes();
+
+        let mut guard = self.stream.lock().await;
+
+        if guard.is_none() {
+            *guard = Some(UnixStream::connect(&self.path).await?);
+        }
+
+        // `guard` is `Some` — we just set it above if it was `None`.
+        let Some(stream) = guard.as_mut() else {
+            return Err(ClientError::Io(std::io::Error::other(
+                "internal: Unix stream not initialised",
+            )));
+        };
+
+        if let Err(e) = stream.write_all(frame_bytes).await {
+            // Drop the broken connection; next call will reconnect.
+            *guard = None;
+            return Err(ClientError::Io(e));
+        }
+
+        Ok(())
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    reason = "unwrap is appropriate in test assertions"
+)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::io::AsyncReadExt;
+    use tokio::net::UnixListener;
+
+    use logfence_proto::syslog::{Facility, Priority, Severity};
+
+    use super::*;
+
+    fn sample_msg() -> SyslogMessage {
+        SyslogMessage {
+            priority: Priority(Facility::Local0, Severity::Info),
+            timestamp: None,
+            hostname: None,
+            app_name: Some("test".into()),
+            proc_id: None,
+            msg_id: None,
+            structured_data: "-".into(),
+            msg: r#"{"k":"v"}"#.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn unix_transport_sends_octet_count_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("test.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+
+        let transport = UnixTransport::new(&sock_path, 65536);
+        let msg = sample_msg();
+        let expected_wire = msg.to_string();
+
+        let send_task = tokio::spawn(async move { transport.send(&msg).await.unwrap() });
+
+        let (mut conn, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(1), conn.read(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let received = std::str::from_utf8(&buf[..n]).unwrap();
+
+        // Frame must be "<count> <message>"
+        let (count_str, body) = received.split_once(' ').unwrap();
+        assert_eq!(count_str.parse::<usize>().unwrap(), expected_wire.len());
+        assert_eq!(body, expected_wire);
+
+        send_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unix_transport_reconnects_after_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("reconnect.sock");
+
+        let transport = UnixTransport::new(&sock_path, 65536);
+        let msg = sample_msg();
+
+        // First send fails — no listener yet.
+        assert!(transport.send(&msg).await.is_err());
+
+        // Start listener, second send should succeed.
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let send_task = tokio::spawn({
+            let msg = msg.clone();
+            async move { transport.send(&msg).await }
+        });
+
+        let accept = tokio::time::timeout(Duration::from_secs(1), listener.accept()).await;
+        assert!(accept.is_ok());
+        assert!(send_task.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn unix_transport_rejects_oversized_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("oversize.sock");
+        let transport = UnixTransport::new(&sock_path, 10); // tiny limit
+
+        let err = transport.send(&sample_msg()).await.unwrap_err();
+        assert!(matches!(err, ClientError::MessageTooLarge { .. }));
+    }
+}

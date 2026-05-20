@@ -1,0 +1,74 @@
+<!--
+  logfence — square icon mark (no logotype)
+  logo-square.svg  ·  100×100 px viewBox
+
+  CONCEPT
+  ═══════
+  Same visual metaphor as logo-full.svg but self-contained as a standalone mark:
+  favicons, app icons, README badges, and contexts where the product name is already
+  present. The icon reads left-to-right as a data-flow diagram — log lines approach
+  a fence/filter and fewer validated lines emerge on the other side.
+
+  DESIGN NOTES
+  ════════════
+  Layout
+    Square canvas: 100×100. The icon from logo-full.svg extracted verbatim so the
+    two files are pixel-identical in their shared region. No logotype is included.
+
+  Icon structure
+    Background  — navy rounded square (#0F2340, rx 13).
+    Log lines   — six steel-blue pill-shaped rects (rx 2) on the left (x 7–31),
+                  varying widths (15–25 px) to suggest real log records of different
+                  lengths. They stop before the fence gap (fence starts at x 34).
+    Fence       — three rust-orange pickets rendered as polygons with a pointed top
+                  (centred at x 39, 50, 61; body width 6 px; point apex at y 11,
+                  shoulder at y 19, base at y 89). Two horizontal rails (rect, rx 2,
+                  slightly lighter orange #D97040) cross all three pickets at y 36
+                  and y 57, giving structural depth.
+    Output lines — four green pill-shaped rects (rx 2) on the right (x 70–92),
+                  fewer than the input lines to imply that some messages were
+                  filtered/dropped by the validation step.
+
+  Colour palette
+    #0F2340  deep navy      — icon background
+    #5B9BD5  steel blue     — incoming log lines (untrusted input)
+    #CF5D35  rust orange    — fence pickets  (the product; Rust-language accent)
+    #D97040  warm orange    — fence rails    (same hue family, slightly lighter)
+    #3BAA6B  forest green   — validated output lines (safe, forwarded messages)
+
+  Usage guidance
+    Minimum legible size: ~24×24 px rendered. Below that the log lines and fence
+    rails become indistinct; prefer a simplified single-colour silhouette instead.
+    For dark backgrounds the navy background rect provides sufficient contrast.
+    For light backgrounds consider adding a 1 px #E0E0E0 stroke on the background
+    rect or placing the icon on a white card.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100" role="img" aria-label="logfence logo">
+
+  <!-- ── Icon: 100×100 rounded square ─────────────────────────────── -->
+  <rect x="0" y="0" width="100" height="100" rx="13" fill="#0F2340"/>
+
+  <!-- Incoming log lines (left of fence, steel blue, varying widths) -->
+  <rect x="7"  y="20" width="24" height="4" rx="2" fill="#5B9BD5"/>
+  <rect x="7"  y="31" width="18" height="4" rx="2" fill="#5B9BD5"/>
+  <rect x="7"  y="42" width="25" height="4" rx="2" fill="#5B9BD5"/>
+  <rect x="7"  y="53" width="20" height="4" rx="2" fill="#5B9BD5"/>
+  <rect x="7"  y="64" width="23" height="4" rx="2" fill="#5B9BD5"/>
+  <rect x="7"  y="75" width="15" height="4" rx="2" fill="#5B9BD5"/>
+
+  <!-- Fence pickets: three vertical bars with pointed tops (rust orange) -->
+  <polygon points="39,11 42,19 42,89 36,89 36,19" fill="#CF5D35"/>
+  <polygon points="50,11 53,19 53,89 47,89 47,19" fill="#CF5D35"/>
+  <polygon points="61,11 64,19 64,89 58,89 58,19" fill="#CF5D35"/>
+
+  <!-- Fence horizontal rails (slightly lighter orange, cross all three pickets) -->
+  <rect x="34" y="36" width="32" height="6" rx="2" fill="#D97040"/>
+  <rect x="34" y="57" width="32" height="6" rx="2" fill="#D97040"/>
+
+  <!-- Validated log lines (right of fence, green, fewer — some were filtered) -->
+  <rect x="70" y="26" width="23" height="4" rx="2" fill="#3BAA6B"/>
+  <rect x="70" y="42" width="19" height="4" rx="2" fill="#3BAA6B"/>
+  <rect x="70" y="57" width="23" height="4" rx="2" fill="#3BAA6B"/>
+  <rect x="70" y="72" width="16" height="4" rx="2" fill="#3BAA6B"/>
+
+</svg>

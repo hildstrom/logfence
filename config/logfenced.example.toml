@@ -1,0 +1,123 @@
+# logfenced.toml — logfence daemon configuration
+# Copy to /etc/logfenced/logfenced.toml and adjust for your environment.
+
+[daemon]
+# Path where the daemon listens for application connections.
+listen_socket = "/run/logfenced/logfenced.sock"
+# Octal permissions on the socket file (as a string to avoid TOML octal ambiguity).
+socket_mode = "0660"
+# Optional: chown the socket to this group (the group must exist).
+# socket_group = "logfence"
+# Maximum simultaneous application connections.
+max_connections = 256
+# Maximum accepted syslog message size in bytes.
+max_message_size = 65536
+# Framing mode for the incoming Unix stream socket.
+# "octet_count" — RFC 6587 §3.4.1 (preferred; handles embedded newlines in JSON)
+# "newline"     — one message per line (simpler clients)
+framing = "octet_count"
+# Sender identity in forwarded messages.
+# "original"  — forward the original hostname, app_name, and proc_id unchanged (default).
+# "logfenced" — replace sender fields with logfenced's own identity.
+#               The original hostname, app_name, and proc_id are preserved in RFC 5424
+#               STRUCTURED-DATA as [logfence.src hostname="..." app="..." pid="..."].
+# sender = "original"
+
+[rsyslog]
+# How to forward valid messages to rsyslog.
+# One of: "unix_dgram", "unix_stream"
+transport = "unix_dgram"
+# Socket path for unix_dgram / unix_stream transports.
+# Linux default: /run/syslog  (rsyslog imuxsock)
+# macOS default: /var/run/syslog
+socket = "/run/syslog"
+
+[validation]
+# Schema enforcement mode.
+# "strict" — message must match at least one schema; non-matching messages are dropped.
+# "warn"   — log schema mismatch but forward the message anyway.
+# "off"    — only require a valid JSON object; skip schema comparison entirely.
+mode = "strict"
+# Paths to JSON Schema files used for linear-scan validation (draft 7 and 2019-09
+# are supported).  All schemas are tried in order; a message passes if any one matches.
+# Leave empty to accept any well-formed JSON object.
+schemas = [
+    # "/etc/logfenced/schemas/audit.schema.json",
+    # "/etc/logfenced/schemas/metrics.schema.json",
+]
+
+# Discriminator-based schema routing (optional).
+#
+# When `discriminator` is set to a JSON field name, the daemon reads that field's
+# string value from each incoming message and performs an O(1) hash-map lookup to
+# select the matching schema — eliminating the O(N) linear scan over `schemas` when
+# many schemas are present.
+#
+# Messages whose discriminator field is absent, or whose value is not listed in
+# [validation.schema_map], fall back to the `schemas` linear scan above.  This
+# lets you route well-known services directly while still catching everything else.
+#
+# Requires [validation.schema_map] to be non-empty when set.
+# discriminator = "service"
+
+# Maps discriminator field values to JSON Schema file paths.
+# Only used when `discriminator` is set above.
+#
+# [validation.schema_map]
+# api-gateway   = "/etc/logfenced/schemas/api-gateway.schema.json"
+# auth-service  = "/etc/logfenced/schemas/auth-service.schema.json"
+# billing       = "/etc/logfenced/schemas/billing.schema.json"
+
+# MITRE CEE cookie handling for incoming messages.
+#
+# The CEE cookie (@cee:) is a prefix prepended to the MSG field to signal that
+# the body is a CEE-formatted JSON object.  logfenced strips the prefix before
+# JSON parsing and schema validation.
+#
+# "never"    — @cee: must not be present; messages with the cookie are dropped.
+# "optional" — @cee: is accepted and stripped, but plain JSON is also allowed.
+# "always"   — @cee: must be present; plain-JSON messages are dropped.
+#
+# Default: "never"
+# input_cee = "never"
+
+# MITRE CEE cookie handling for outgoing (forwarded) messages.
+#
+# Controls whether @cee: appears in the MSG field of messages forwarded to
+# rsyslog.  This is independent of input_cee, so the daemon can accept plain
+# JSON from applications and add the cookie before forwarding, or accept CEE
+# messages and strip the cookie if rsyslog does not expect it.
+#
+# "never"    — strip @cee: before forwarding (or forward as-is if absent).
+# "optional" — forward MSG unchanged (preserves whatever the client sent).
+# "always"   — add @cee: if absent before forwarding (or preserve if present).
+#
+# Default: "never"
+# output_cee = "never"
+
+# Canonical JSON output.
+#
+# When true, the JSON payload is parsed and re-serialized before forwarding with
+# all object keys sorted in ascending lexicographic order at every nesting level
+# and no unnecessary whitespace.  This makes forwarded messages byte-for-byte
+# deterministic regardless of how the sending application serialized its JSON.
+#
+# When false (the default) the original JSON string is forwarded as-is.  This
+# avoids a parse + re-serialize cycle and keeps forwarding throughput at its
+# maximum.
+#
+# Default: false
+# canonical_json = false
+
+[logging]
+# Daemon's own operational log level (not the syslog messages it handles).
+# Values: "error", "warn", "info", "debug", "trace"
+level = "info"
+# Destination for the daemon's own logs: "stderr" or an absolute file path.
+output = "stderr"
+
+[metrics]
+# Unix stream socket that serves a JSON metrics snapshot to each connecting
+# client. Only active when logfenced is compiled with --features metrics.
+# Query with: socat - UNIX-CONNECT:/run/logfenced/logfenced.stats.sock
+socket = "/run/logfenced/logfenced.stats.sock"

@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd service definition for logfenced on macOS.
+  Install to /Library/LaunchDaemons/com.logfence.logfenced.plist
+
+  Prerequisites:
+    1. Create the _logfence user/group:
+         sudo dscl . -create /Users/_logfence
+         sudo dscl . -create /Users/_logfence UserShell /usr/bin/false
+         sudo dscl . -create /Users/_logfence UniqueID 450
+         sudo dscl . -create /Groups/_logfence GroupMembership _logfence
+         sudo dscl . -create /Groups/_logfence PrimaryGroupID 450
+    2. Create runtime and log directories:
+         sudo mkdir -p /var/run/logfenced /var/log/logfenced
+         sudo chown _logfence:_logfence /var/run/logfenced /var/log/logfenced
+         sudo chmod 0750 /var/run/logfenced /var/log/logfenced
+    3. Install logfenced binary:
+         sudo cp logfenced /usr/local/bin/logfenced
+    4. Install config:
+         sudo cp config/logfenced.example.toml /usr/local/etc/logfenced/logfenced.toml
+         (edit to taste)
+    5. Load the service:
+         sudo launchctl load /Library/LaunchDaemons/com.logfence.logfenced.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.logfence.logfenced</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/logfenced</string>
+        <string>--config</string>
+        <string>/usr/local/etc/logfenced/logfenced.toml</string>
+    </array>
+
+    <!-- Start automatically at boot. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart if the daemon exits unexpectedly. -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Run as the dedicated logfence system account. -->
+    <key>UserName</key>
+    <string>_logfence</string>
+
+    <key>GroupName</key>
+    <string>_logfence</string>
+
+    <!-- Route daemon's own operational log to a file. -->
+    <key>StandardOutPath</key>
+    <string>/var/log/logfenced/logfenced.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/var/log/logfenced/logfenced.log</string>
+
+    <!-- Restrict filesystem access to what logfenced needs. -->
+    <key>WorkingDirectory</key>
+    <string>/var/run/logfenced</string>
+</dict>
+</plist>
