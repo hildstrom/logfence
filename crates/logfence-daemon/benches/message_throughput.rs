@@ -11,8 +11,8 @@
 //! as `no_schema` but uses a Unix datagram socket as the daemon input
 //! (`listen_transport = "unix_dgram"`).  Clients send via
 //! [`UnixDatagramTransport`]; there is no framing overhead.  The daemon
-//! receive loop processes one datagram at a time, so concurrency effects
-//! differ from the stream case.
+//! receive loop drains all queued datagrams per readability event but remains
+//! serialised, so concurrency effects differ from the stream case.
 //!
 //! **With schema** (`with_schema` group): `[validation] mode = "strict"` with
 //! a ten-field JSON Schema.  Measures the combined cost of stream transport,
@@ -401,9 +401,10 @@ fn bench_load_100x10(c: &mut Criterion) {
 //
 // These benchmarks are the datagram-input counterparts of the no_schema group.
 // The daemon is configured with `listen_transport = "unix_dgram"` and clients
-// use UnixDatagramTransport.  There is no framing overhead.  The daemon's
-// single receive loop processes one datagram at a time, so the fan-in
-// benchmarks measure serialized throughput rather than parallel session scaling.
+// use UnixDatagramTransport.  There is no framing overhead.  The daemon receive
+// loop drains all queued datagrams per readability event via try_recv_from, but
+// processing remains serialised, so the fan-in benchmarks measure serialised
+// throughput rather than parallel session scaling.
 
 /// One datagram sender sending 1 000 messages per iteration.
 ///

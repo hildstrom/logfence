@@ -27,16 +27,18 @@ octet-count framing.  Message body: `{"event":"bench"}` or `{"event":"load"}`
 
 `[validation] mode = "off"` — same validation policy as `no_schema`.  Input:
 Unix datagram socket (`listen_transport = "unix_dgram"`); clients use
-`UnixDatagramTransport` with no framing.  The daemon's single receive loop
-processes one datagram at a time, so the fan-in benchmarks do not benefit from
-the parallel session scaling seen in the stream group.  Message body:
-`{"event":"bench"}` or `{"event":"load"}`.
+`UnixDatagramTransport` with no framing.  The receive loop waits for a single
+readability event and then drains all queued datagrams via `try_recv_from`
+before returning to the scheduler, amortising the per-wakeup cost across
+bursts.  The loop remains serialised (no parallel session tasks), so the fan-in
+benchmarks do not benefit from the concurrent session scaling seen in the stream
+group.  Message body: `{"event":"bench"}` or `{"event":"load"}`.
 
 | Benchmark | Senders | Msgs/sender | Median thrpt | 95% CI |
 |---|---|---|---|---|
-| `load_1x1000` | 1 | 1 000 | 297.07 Kelem/s | 294.9 – 299.4 |
-| `load_4x250` | 4 | 250 | 304.28 Kelem/s | 302.2 – 306.3 |
-| `load_100x10` | 100 | 10 | 308.84 Kelem/s | 306.3 – 311.4 |
+| `load_1x1000` | 1 | 1 000 | 322.27 Kelem/s | 321.47 – 323.07 |
+| `load_4x250` | 4 | 250 | 319.96 Kelem/s | 318.74 – 321.02 |
+| `load_100x10` | 100 | 10 | 315.61 Kelem/s | 314.48 – 316.69 |
 
 ## with_schema
 
@@ -72,9 +74,9 @@ the bottleneck at that point rather than connection fan-in.
 
 | Benchmark | no_schema (stream) | no_schema_dgram | Ratio |
 |---|---|---|---|
-| `load_1x1000` | 913.07 Kelem/s | 297.07 Kelem/s | 3.1× |
-| `load_4x250` | 1 232.8 Kelem/s | 304.28 Kelem/s | 4.1× |
-| `load_100x10` | 1 092.6 Kelem/s | 308.84 Kelem/s | 3.5× |
+| `load_1x1000` | 913.07 Kelem/s | 322.27 Kelem/s | 2.8× |
+| `load_4x250` | 1 232.8 Kelem/s | 319.96 Kelem/s | 3.9× |
+| `load_100x10` | 1 092.6 Kelem/s | 315.61 Kelem/s | 3.5× |
 
 The datagram path is roughly 3–4× slower than the stream path.  Two structural
 differences drive this:
@@ -83,24 +85,30 @@ differences drive this:
 syscall can return tens of kilobytes covering dozens of framed messages.  The
 codec decodes all of them from its buffer without touching the OS again,
 amortising I/O overhead across many messages.  With datagrams, each message
-requires its own `recv_from()` syscall — the datagram boundary is the syscall
-boundary — so syscall overhead scales linearly with message count rather than
-being amortised.
+requires its own `try_recv_from()` syscall — the datagram boundary is the
+syscall boundary — so syscall overhead scales linearly with message count.  The
+drain loop amortises the *scheduler* cost (one `readable()` wakeup covers the
+full queued burst) but cannot collapse multiple datagrams into a single syscall.
 
 Note that the output datagram socket (daemon → rsyslog) does not face this
 constraint in the stream-input benchmarks: the mock rsyslog socket has a 1 MB
 receive buffer and a dedicated drainer thread, so the daemon's `send_to()` calls
 return immediately without waiting for the receiver.  The output datagram is
-non-blocking in practice; it is not the bottleneck.  The datagram *input* path
-has no equivalent buffering benefit because the daemon cannot batch `recv_from`
-calls.
+non-blocking in practice; it is not the bottleneck.
 
 **Flat fan-in.**  The stream listener spawns a separate Tokio task per
 connection, so 4 or 100 sessions execute concurrently and overlap I/O and
 validation work.  The datagram listener is a single receive loop that handles
-one message at a time, regardless of how many senders are active.  As a result,
+messages serially regardless of how many senders are active.  As a result,
 the datagram group's throughput is nearly flat across all three load variants
-(297–309 Kelem/s) while the stream group scales from 913 to 1 233 Kelem/s.
+(316–322 Kelem/s) while the stream group scales from 913 to 1 233 Kelem/s.
+
+The drain loop improvement is most pronounced on the single-sender case (+8.5%)
+where the sender can queue the next datagram while the daemon is processing the
+previous one; the daemon then picks it up immediately on the next
+`try_recv_from` call without going back through the Tokio scheduler.  With more
+senders sending smaller per-sender bursts the queuing depth stays low and the
+benefit is smaller (+2–5%).
 
 The appropriate transport choice depends on the deployment context.  Unix stream
 input delivers higher throughput for applications that maintain a persistent

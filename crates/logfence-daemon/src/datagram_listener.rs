@@ -8,12 +8,19 @@
 //!
 //! ## Receive loop design
 //!
-//! The receive loop is deliberately thin.  After each [`recv_from`] the bytes
-//! are copied into an owned [`Bytes`] buffer and all subsequent work (UTF-8
-//! validation, syslog parsing, schema validation, forwarding) is dispatched to
-//! a Tokio task via [`process_datagram`].  The loop returns to [`recv_from`]
-//! as quickly as possible, draining the kernel receive buffer at the highest
-//! possible rate.
+//! The outer loop waits for socket readability via [`readable`] — a single
+//! `epoll`/`kqueue` notification.  Once readable, an inner drain loop calls
+//! [`try_recv_from`] repeatedly until `WouldBlock`, consuming every datagram
+//! already in the kernel receive buffer before yielding back to the Tokio
+//! scheduler.  This amortises the scheduler round-trip cost: when N datagrams
+//! are queued, the current approach wakes the reactor N times; the drain loop
+//! wakes it once.
+//!
+//! Each datagram's bytes are copied into an owned [`Bytes`] buffer and all
+//! subsequent work (UTF-8 validation, syslog parsing, schema validation,
+//! forwarding) is dispatched to a Tokio task via [`process_datagram`].  The
+//! drain loop returns to [`try_recv_from`] immediately after spawning, without
+//! re-entering the scheduler, so the kernel buffer empties as fast as possible.
 //!
 //! A 1 MB kernel receive buffer ([`RECV_BUFFER_SIZE`]) absorbs bursts without
 //! dropping datagrams when the processing tasks temporarily fall behind.
@@ -23,7 +30,7 @@
 //! pipeline is saturated.  On graceful shutdown the loop stops accepting new
 //! datagrams and waits up to 30 seconds for in-flight tasks to complete.
 
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{io, path::Path, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use serde_json::json;
@@ -104,11 +111,11 @@ impl DatagramListener {
     /// Receive datagrams until `shutdown` is cancelled, dispatching each to a
     /// processing task, then drain in-flight tasks before returning.
     ///
-    /// The receive loop copies each datagram into an owned buffer and immediately
-    /// spawns a task for all subsequent work, returning to [`recv_from`] as fast
-    /// as possible.  A semaphore bounded by [`DaemonConfig::max_connections`]
-    /// limits concurrent tasks; if the limit is reached the loop blocks until a
-    /// task finishes before calling [`recv_from`] again.
+    /// The outer loop waits for socket readability, then an inner drain loop
+    /// calls [`try_recv_from`] until `WouldBlock`, consuming every queued
+    /// datagram before yielding back to the scheduler.  A semaphore bounded by
+    /// [`DaemonConfig::max_connections`] limits concurrent tasks; reaching that
+    /// limit causes the drain loop to yield until a task finishes.
     pub async fn run(
         self,
         shutdown: CancellationToken,
@@ -125,57 +132,70 @@ impl DatagramListener {
         let mut buf = vec![0u8; cfg.max_message_size];
         let semaphore = Arc::new(Semaphore::new(cfg.max_connections));
 
-        loop {
-            // ── Step 1: receive the next datagram ─────────────────────────────
-            let (n, addr) = tokio::select! {
+        'recv: loop {
+            // ── Wait for the socket to become readable or for shutdown ─────────
+            tokio::select! {
                 biased;
                 () = shutdown.cancelled() => break,
-                result = socket.recv_from(&mut buf) => match result {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        error!(error = %e, "recv_from() failed on datagram socket");
+                result = socket.readable() => {
+                    if let Err(e) = result {
+                        error!(error = %e, "socket readability poll failed");
                         continue;
                     }
-                },
+                }
             };
 
-            let peer: Arc<str> = addr
-                .as_pathname()
-                .map_or_else(|| "<anonymous>".to_owned(), |p| p.display().to_string())
-                .into();
+            // ── Drain: consume every queued datagram before returning to the ───
+            // ── scheduler, amortising the per-wakeup cost across a full burst. ─
+            loop {
+                // ── Step 1: receive one datagram (non-blocking) ───────────────
+                let (n, addr) = match socket.try_recv_from(&mut buf) {
+                    Ok(pair) => pair,
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => {
+                        error!(error = %e, "recv_from() failed on datagram socket");
+                        break;
+                    }
+                };
 
-            // Copy bytes into an owned buffer so `buf` is free for the next recv.
-            let msg_bytes = Bytes::copy_from_slice(&buf[..n]);
+                let peer: Arc<str> = addr
+                    .as_pathname()
+                    .map_or_else(|| "<anonymous>".to_owned(), |p| p.display().to_string())
+                    .into();
 
-            // ── Step 2: acquire a processing permit (backpressure) ────────────
-            //
-            // Also cancels on shutdown so the loop does not block indefinitely
-            // when all permits are held during a clean shutdown.
-            let permit = tokio::select! {
-                biased;
-                () = shutdown.cancelled() => break,
-                result = semaphore.clone().acquire_owned() => if let Ok(p) = result { p } else {
-                    error!("datagram processing semaphore closed — shutting down");
-                    return;
-                },
-            };
+                // Copy bytes into an owned buffer so `buf` is free for the next recv.
+                let msg_bytes = Bytes::copy_from_slice(&buf[..n]);
 
-            // ── Step 3: spawn processing task ─────────────────────────────────
-            let vr = validator_rx.clone();
-            let fwd = forwarder.clone();
-            let m = Arc::clone(&metrics);
-            let msg_cfg = SessionConfig {
-                framing: cfg.framing,
-                max_message_size: cfg.max_message_size,
-                sender_mode: cfg.sender,
-                local_hostname: Arc::clone(&local_hostname),
-                peer,
-            };
+                // ── Step 2: acquire a processing permit (backpressure) ────────
+                //
+                // Also cancels on shutdown so the loop does not block
+                // indefinitely when all permits are held during a clean shutdown.
+                let permit = tokio::select! {
+                    biased;
+                    () = shutdown.cancelled() => break 'recv,
+                    result = semaphore.clone().acquire_owned() => if let Ok(p) = result { p } else {
+                        error!("datagram processing semaphore closed — shutting down");
+                        return;
+                    },
+                };
 
-            tokio::spawn(async move {
-                process_datagram(msg_bytes, msg_cfg, vr, fwd, m).await;
-                drop(permit);
-            });
+                // ── Step 3: spawn processing task ─────────────────────────────
+                let vr = validator_rx.clone();
+                let fwd = forwarder.clone();
+                let m = Arc::clone(&metrics);
+                let msg_cfg = SessionConfig {
+                    framing: cfg.framing,
+                    max_message_size: cfg.max_message_size,
+                    sender_mode: cfg.sender,
+                    local_hostname: Arc::clone(&local_hostname),
+                    peer,
+                };
+
+                tokio::spawn(async move {
+                    process_datagram(msg_bytes, msg_cfg, vr, fwd, m).await;
+                    drop(permit);
+                });
+            }
         }
 
         // ── Graceful drain ────────────────────────────────────────────────────
