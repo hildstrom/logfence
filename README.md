@@ -142,17 +142,32 @@ schemas = ["/etc/logfenced/schemas/audit.schema.json"]
 ## Performance
 
 On a Linux VM (9 cores, 8 GB RAM) all benchmarks send 1 000 messages per
-Criterion iteration using persistent Unix stream connections.
+Criterion iteration.
+
+**Unix stream input** (`listen_transport = "unix_stream"`, persistent connections):
 
 | Benchmark | No schema | With schema | Overhead |
 |---|---|---|---|
-| 1 connection | 920 Kelem/s | 447 Kelem/s | 2.1× |
-| 4 connections | 1 231 Kelem/s | 708 Kelem/s | 1.7× |
-| 100 connections | 1 084 Kelem/s | 707 Kelem/s | 1.5× |
+| 1 connection | 913 Kelem/s | 442 Kelem/s | 2.1× |
+| 4 connections | 1 233 Kelem/s | 703 Kelem/s | 1.8× |
+| 100 connections | 1 093 Kelem/s | 724 Kelem/s | 1.5× |
 
-Schema validation (JSON parse + `jsonschema` evaluation) costs roughly 2× on a
-single connection. The overhead drops to 1.5× at 100 connections as the Tokio
-scheduler overlaps validation work across concurrent sessions.
+Schema validation costs roughly 2× on a single connection. The overhead drops
+to 1.5× at 100 connections as the Tokio scheduler overlaps validation work
+across concurrent sessions.
+
+**Unix datagram input** (`listen_transport = "unix_dgram"`, no schema):
+
+| Benchmark | Senders | Median thrpt |
+|---|---|---|
+| 1 sender × 1 000 msgs | 1 | 297 Kelem/s |
+| 4 senders × 250 msgs | 4 | 304 Kelem/s |
+| 100 senders × 10 msgs | 100 | 309 Kelem/s |
+
+Datagram throughput is roughly 3× lower than stream throughput and flat across
+sender counts because the daemon's single receive loop processes one datagram at
+a time. This is the right choice when logfenced acts as a drop-in
+man-in-the-middle for existing syslog clients.
 
 Full benchmark details and methodology: [docs/BENCHMARK.md](docs/BENCHMARK.md)
 

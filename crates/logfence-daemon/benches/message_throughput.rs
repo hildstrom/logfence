@@ -1,21 +1,27 @@
 //! Throughput benchmarks for the logfenced message pipeline.
 //!
-//! Benchmarks are divided into two categories:
+//! Benchmarks are divided into three categories:
 //!
-//! **No schema** (`no_schema` group): `[validation] mode = "off"` — the
-//! daemon only checks that the payload is a JSON object. Measures raw transport
-//! and framing cost with a minimal single-field message.
+//! **No schema, stream** (`no_schema` group): `[validation] mode = "off"` —
+//! the daemon only checks that the payload is a JSON object.  Measures raw
+//! transport and framing cost with a minimal single-field message.  Uses a
+//! Unix stream socket as the daemon input (`listen_transport = "unix_stream"`).
 //!
-//! **With schema** (`with_schema` group): `[validation] mode =
-//! "strict"` with a ten-field JSON Schema. Measures the combined cost of
-//! transport, framing, JSON parsing, and `jsonschema` evaluation against a
-//! realistic message shape. Each benchmark in this group is a direct duplicate
-//! of its no-validation counterpart so the two sets can be compared to isolate
-//! schema-validation overhead.
+//! **No schema, datagram** (`no_schema_dgram` group): same validation policy
+//! as `no_schema` but uses a Unix datagram socket as the daemon input
+//! (`listen_transport = "unix_dgram"`).  Clients send via
+//! [`UnixDatagramTransport`]; there is no framing overhead.  The daemon
+//! receive loop processes one datagram at a time, so concurrency effects
+//! differ from the stream case.
 //!
-//! Each benchmark sends 1 000 messages per iteration across 1, 4, or 100
-//! persistent connections, exercising single-connection throughput and
-//! concurrent fan-in at increasing scales.
+//! **With schema** (`with_schema` group): `[validation] mode = "strict"` with
+//! a ten-field JSON Schema.  Measures the combined cost of stream transport,
+//! framing, JSON parsing, and `jsonschema` evaluation against a realistic
+//! message shape.
+//!
+//! Each benchmark sends 1 000 messages per iteration.  The three load variants
+//! distribute those messages across 1, 4, or 100 senders to exercise
+//! single-sender throughput and concurrent fan-in at increasing scales.
 //!
 //! All benchmarks are intentionally coarse — they catch regressions of ≥10 %
 //! rather than nanosecond noise.
@@ -25,6 +31,7 @@
 //!
 //! Run one category:
 //!   cargo bench -p logfence-daemon -- `no_schema`/
+//!   cargo bench -p logfence-daemon -- `no_schema_dgram`/
 //!   cargo bench -p logfence-daemon -- `with_schema`/
 #![cfg(unix)]
 #![allow(
@@ -46,7 +53,7 @@ use std::{
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use tempfile::TempDir;
 
-use logfence_client::{MessageBuilder, UnixTransport};
+use logfence_client::{MessageBuilder, UnixDatagramTransport, UnixTransport};
 use logfence_proto::syslog::{Facility, Severity};
 
 // ── Validation schema and message ─────────────────────────────────────────────
@@ -123,20 +130,28 @@ struct BenchSetup {
 }
 
 impl BenchSetup {
-    /// Start logfenced with `[validation] mode = "off"`.
+    /// Start logfenced with `[validation] mode = "off"`, Unix stream input.
     fn start() -> Self {
-        Self::start_inner(None)
+        Self::start_inner(None, false)
+    }
+
+    /// Start logfenced with `[validation] mode = "off"`, Unix datagram input.
+    fn start_dgram() -> Self {
+        Self::start_inner(None, true)
     }
 
     /// Start logfenced with `[validation] mode = "strict"` and
-    /// [`VALIDATION_SCHEMA`] compiled in.
+    /// [`VALIDATION_SCHEMA`] compiled in, Unix stream input.
     fn start_validated() -> Self {
-        Self::start_inner(Some(VALIDATION_SCHEMA))
+        Self::start_inner(Some(VALIDATION_SCHEMA), false)
     }
 
-    /// Shared startup logic. When `schema_json` is `Some`, writes it to
-    /// `schema.json` inside the temp dir and enables strict validation.
-    fn start_inner(schema_json: Option<&str>) -> Self {
+    /// Shared startup logic.
+    ///
+    /// `schema_json` — when `Some`, writes the schema to `schema.json` and
+    /// enables strict validation.
+    /// `dgram_input` — when `true`, configures `listen_transport = "unix_dgram"`.
+    fn start_inner(schema_json: Option<&str>, dgram_input: bool) -> Self {
         let dir = tempfile::tempdir().expect("create temp dir");
         let listen_path = dir.path().join("logfenced.sock");
         let rsyslog_path = dir.path().join("rsyslog.sock");
@@ -167,11 +182,19 @@ impl BenchSetup {
             None => "[validation]\nmode = \"off\"\n".to_owned(),
         };
 
+        let listen_transport_line = if dgram_input {
+            "listen_transport = \"unix_dgram\"\n"
+        } else {
+            ""
+        };
+
         let config = format!(
             "[daemon]\nlisten_socket = \"{listen}\"\nsocket_mode = \"0600\"\n\
+             {listen_transport}\
              [rsyslog]\ntransport = \"unix_dgram\"\nsocket = \"{rsyslog}\"\n\
              {validation_section}",
             listen = listen_path.display(),
+            listen_transport = listen_transport_line,
             rsyslog = rsyslog_path.display(),
         );
         std::fs::write(&config_path, &config).expect("write config");
@@ -224,14 +247,14 @@ impl Drop for BenchSetup {
     }
 }
 
-// ── No-validation benchmarks ──────────────────────────────────────────────────
+// ── No-schema stream benchmarks ───────────────────────────────────────────────
 
-/// One persistent connection sending 1 000 messages per iteration.
+/// One persistent stream connection sending 1 000 messages per iteration.
 ///
 /// Measures the end-to-end cost of encoding syslog frames and writing them
 /// through the Unix stream socket into the daemon. Validation is off;
 /// message body is `{"event":"bench"}`.
-fn bench_single_connection_1k(c: &mut Criterion) {
+fn bench_load_1x1000(c: &mut Criterion) {
     const TOTAL_MSGS: u64 = 1_000;
 
     let setup = BenchSetup::start();
@@ -250,7 +273,7 @@ fn bench_single_connection_1k(c: &mut Criterion) {
     let mut group = c.benchmark_group("no_schema");
     group.throughput(Throughput::Elements(TOTAL_MSGS));
 
-    group.bench_function("single_connection_1k", |b| {
+    group.bench_function("load_1x1000", |b| {
         b.iter(|| {
             rt.block_on(async {
                 for _ in 0..TOTAL_MSGS {
@@ -268,14 +291,14 @@ fn bench_single_connection_1k(c: &mut Criterion) {
     group.finish();
 }
 
-/// 4 persistent connections round-robined across 1 000 messages per iteration
-/// (250 messages per connection).
+/// 4 persistent stream connections round-robined across 1 000 messages per
+/// iteration (250 messages per connection).
 ///
 /// Exercises the daemon under light concurrent fan-in: each of the 4 open
 /// Unix stream connections contributes 250 messages per benchmark iteration,
 /// interleaved to keep all sessions active throughout the measurement.
 /// Validation is off; message body is `{"event":"load"}`.
-fn bench_sustained_load_4x250(c: &mut Criterion) {
+fn bench_load_4x250(c: &mut Criterion) {
     const CONNS: usize = 4;
     const MSGS_PER_CONN: u64 = 250;
     const TOTAL_MSGS: u64 = CONNS as u64 * MSGS_PER_CONN;
@@ -301,7 +324,7 @@ fn bench_sustained_load_4x250(c: &mut Criterion) {
     let mut group = c.benchmark_group("no_schema");
     group.throughput(Throughput::Elements(TOTAL_MSGS));
 
-    group.bench_function("sustained_load_4x250", |b| {
+    group.bench_function("load_4x250", |b| {
         b.iter(|| {
             rt.block_on(async {
                 for _ in 0..MSGS_PER_CONN {
@@ -321,14 +344,14 @@ fn bench_sustained_load_4x250(c: &mut Criterion) {
     group.finish();
 }
 
-/// 100 persistent connections round-robined across 1 000 messages per iteration
-/// (10 messages per connection).
+/// 100 persistent stream connections round-robined across 1 000 messages per
+/// iteration (10 messages per connection).
 ///
 /// Exercises the daemon under heavy concurrent fan-in: 100 simultaneous
 /// Unix stream sessions interleaved across 10 rounds. This stresses
 /// the Tokio scheduler and the semaphore-bounded accept loop.
 /// Validation is off; message body is `{"event":"load"}`.
-fn bench_sustained_load_100x10(c: &mut Criterion) {
+fn bench_load_100x10(c: &mut Criterion) {
     const CONNS: usize = 100;
     const MSGS_PER_CONN: u64 = 10;
     const TOTAL_MSGS: u64 = CONNS as u64 * MSGS_PER_CONN;
@@ -354,10 +377,166 @@ fn bench_sustained_load_100x10(c: &mut Criterion) {
     let mut group = c.benchmark_group("no_schema");
     group.throughput(Throughput::Elements(TOTAL_MSGS));
 
-    group.bench_function("sustained_load_100x10", |b| {
+    group.bench_function("load_100x10", |b| {
         b.iter(|| {
             rt.block_on(async {
                 for _ in 0..MSGS_PER_CONN {
+                    for t in &transports {
+                        MessageBuilder::new(Facility::Local0, Severity::Info)
+                            .kv("event", "load")
+                            .expect("kv")
+                            .send(t)
+                            .await
+                            .expect("load send");
+                    }
+                }
+            });
+        });
+    });
+
+    group.finish();
+}
+
+// ── No-schema datagram benchmarks ─────────────────────────────────────────────
+//
+// These benchmarks are the datagram-input counterparts of the no_schema group.
+// The daemon is configured with `listen_transport = "unix_dgram"` and clients
+// use UnixDatagramTransport.  There is no framing overhead.  The daemon's
+// single receive loop processes one datagram at a time, so the fan-in
+// benchmarks measure serialized throughput rather than parallel session scaling.
+
+/// One datagram sender sending 1 000 messages per iteration.
+///
+/// Measures the end-to-end cost of sending raw RFC 5424 datagrams through the
+/// Unix datagram socket into the daemon. Validation is off;
+/// message body is `{"event":"bench"}`.
+fn bench_load_1x1000_dgram(c: &mut Criterion) {
+    const TOTAL_MSGS: u64 = 1_000;
+
+    let setup = BenchSetup::start_dgram();
+    let rt = tokio::runtime::Runtime::new().expect("build tokio runtime");
+    let transport = UnixDatagramTransport::new(&setup.listen_path, 65_536);
+
+    rt.block_on(async {
+        MessageBuilder::new(Facility::Local0, Severity::Info)
+            .kv("event", "warmup")
+            .expect("kv")
+            .send(&transport)
+            .await
+            .expect("warmup send");
+    });
+
+    let mut group = c.benchmark_group("no_schema_dgram");
+    group.throughput(Throughput::Elements(TOTAL_MSGS));
+
+    group.bench_function("load_1x1000", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                for _ in 0..TOTAL_MSGS {
+                    MessageBuilder::new(Facility::Local0, Severity::Info)
+                        .kv("event", "bench")
+                        .expect("kv")
+                        .send(&transport)
+                        .await
+                        .expect("bench send");
+                }
+            });
+        });
+    });
+
+    group.finish();
+}
+
+/// 4 datagram senders interleaved across 1 000 messages per iteration
+/// (250 messages per sender).
+///
+/// Each sender is an independent [`UnixDatagramTransport`].  The daemon
+/// receive loop is single-threaded so messages are processed serially
+/// regardless of sender count.
+/// Validation is off; message body is `{"event":"load"}`.
+fn bench_load_4x250_dgram(c: &mut Criterion) {
+    const SENDERS: usize = 4;
+    const MSGS_PER_SENDER: u64 = 250;
+    const TOTAL_MSGS: u64 = SENDERS as u64 * MSGS_PER_SENDER;
+
+    let setup = BenchSetup::start_dgram();
+    let rt = tokio::runtime::Runtime::new().expect("build tokio runtime");
+
+    let transports: Vec<UnixDatagramTransport> = (0..SENDERS)
+        .map(|_| UnixDatagramTransport::new(&setup.listen_path, 65_536))
+        .collect();
+
+    rt.block_on(async {
+        for t in &transports {
+            MessageBuilder::new(Facility::Local0, Severity::Info)
+                .kv("event", "warmup")
+                .expect("kv")
+                .send(t)
+                .await
+                .expect("warmup");
+        }
+    });
+
+    let mut group = c.benchmark_group("no_schema_dgram");
+    group.throughput(Throughput::Elements(TOTAL_MSGS));
+
+    group.bench_function("load_4x250", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                for _ in 0..MSGS_PER_SENDER {
+                    for t in &transports {
+                        MessageBuilder::new(Facility::Local0, Severity::Info)
+                            .kv("event", "load")
+                            .expect("kv")
+                            .send(t)
+                            .await
+                            .expect("load send");
+                    }
+                }
+            });
+        });
+    });
+
+    group.finish();
+}
+
+/// 100 datagram senders interleaved across 1 000 messages per iteration
+/// (10 messages per sender).
+///
+/// Each sender is an independent [`UnixDatagramTransport`].  The daemon
+/// receive loop is single-threaded so messages are processed serially
+/// regardless of sender count.
+/// Validation is off; message body is `{"event":"load"}`.
+fn bench_load_100x10_dgram(c: &mut Criterion) {
+    const SENDERS: usize = 100;
+    const MSGS_PER_SENDER: u64 = 10;
+    const TOTAL_MSGS: u64 = SENDERS as u64 * MSGS_PER_SENDER;
+
+    let setup = BenchSetup::start_dgram();
+    let rt = tokio::runtime::Runtime::new().expect("build tokio runtime");
+
+    let transports: Vec<UnixDatagramTransport> = (0..SENDERS)
+        .map(|_| UnixDatagramTransport::new(&setup.listen_path, 65_536))
+        .collect();
+
+    rt.block_on(async {
+        for t in &transports {
+            MessageBuilder::new(Facility::Local0, Severity::Info)
+                .kv("event", "warmup")
+                .expect("kv")
+                .send(t)
+                .await
+                .expect("warmup");
+        }
+    });
+
+    let mut group = c.benchmark_group("no_schema_dgram");
+    group.throughput(Throughput::Elements(TOTAL_MSGS));
+
+    group.bench_function("load_100x10", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                for _ in 0..MSGS_PER_SENDER {
                     for t in &transports {
                         MessageBuilder::new(Facility::Local0, Severity::Info)
                             .kv("event", "load")
@@ -381,18 +560,17 @@ fn bench_sustained_load_100x10(c: &mut Criterion) {
 //   - BenchSetup::start_validated() enabling strict JSON Schema validation
 //   - validated_message_builder() producing a ten-field message body
 //
-// Compare pairs (e.g. no_schema/single_connection_1k vs
-// with_schema/single_connection_1k) to isolate the cost of JSON
-// parsing and jsonschema evaluation from transport and framing overhead.
+// Compare pairs (e.g. no_schema/load_1x1000 vs with_schema/load_1x1000) to
+// isolate the cost of JSON parsing and jsonschema evaluation from transport
+// and framing overhead.
 
-/// One persistent connection, strict validation enabled, 1 000 messages per
-/// iteration.
+/// One persistent stream connection, strict validation enabled, 1 000 messages
+/// per iteration.
 ///
 /// Message body is the ten-field JSON object produced by
-/// [`validated_message_builder`]. Compare with
-/// `no_schema/single_connection_1k` to isolate schema-validation overhead
-/// on a single connection.
-fn bench_single_connection_1k_validated(c: &mut Criterion) {
+/// [`validated_message_builder`]. Compare with `no_schema/load_1x1000` to
+/// isolate schema-validation overhead on a single connection.
+fn bench_load_1x1000_validated(c: &mut Criterion) {
     const TOTAL_MSGS: u64 = 1_000;
 
     let setup = BenchSetup::start_validated();
@@ -409,7 +587,7 @@ fn bench_single_connection_1k_validated(c: &mut Criterion) {
     let mut group = c.benchmark_group("with_schema");
     group.throughput(Throughput::Elements(TOTAL_MSGS));
 
-    group.bench_function("single_connection_1k", |b| {
+    group.bench_function("load_1x1000", |b| {
         b.iter(|| {
             rt.block_on(async {
                 for _ in 0..TOTAL_MSGS {
@@ -425,12 +603,12 @@ fn bench_single_connection_1k_validated(c: &mut Criterion) {
     group.finish();
 }
 
-/// 4 persistent connections, strict validation enabled, round-robined across
-/// 1 000 messages per iteration (250 per connection).
+/// 4 persistent stream connections, strict validation enabled, round-robined
+/// across 1 000 messages per iteration (250 per connection).
 ///
-/// Compare with `no_schema/sustained_load_4x250` to isolate
-/// schema-validation overhead under light concurrent fan-in.
-fn bench_sustained_load_4x250_validated(c: &mut Criterion) {
+/// Compare with `no_schema/load_4x250` to isolate schema-validation overhead
+/// under light concurrent fan-in.
+fn bench_load_4x250_validated(c: &mut Criterion) {
     const CONNS: usize = 4;
     const MSGS_PER_CONN: u64 = 250;
     const TOTAL_MSGS: u64 = CONNS as u64 * MSGS_PER_CONN;
@@ -451,7 +629,7 @@ fn bench_sustained_load_4x250_validated(c: &mut Criterion) {
     let mut group = c.benchmark_group("with_schema");
     group.throughput(Throughput::Elements(TOTAL_MSGS));
 
-    group.bench_function("sustained_load_4x250", |b| {
+    group.bench_function("load_4x250", |b| {
         b.iter(|| {
             rt.block_on(async {
                 for _ in 0..MSGS_PER_CONN {
@@ -469,12 +647,12 @@ fn bench_sustained_load_4x250_validated(c: &mut Criterion) {
     group.finish();
 }
 
-/// 100 persistent connections, strict validation enabled, round-robined across
-/// 1 000 messages per iteration (10 per connection).
+/// 100 persistent stream connections, strict validation enabled, round-robined
+/// across 1 000 messages per iteration (10 per connection).
 ///
-/// Compare with `no_schema/sustained_load_100x10` to isolate
-/// schema-validation overhead under heavy concurrent fan-in.
-fn bench_sustained_load_100x10_validated(c: &mut Criterion) {
+/// Compare with `no_schema/load_100x10` to isolate schema-validation overhead
+/// under heavy concurrent fan-in.
+fn bench_load_100x10_validated(c: &mut Criterion) {
     const CONNS: usize = 100;
     const MSGS_PER_CONN: u64 = 10;
     const TOTAL_MSGS: u64 = CONNS as u64 * MSGS_PER_CONN;
@@ -495,7 +673,7 @@ fn bench_sustained_load_100x10_validated(c: &mut Criterion) {
     let mut group = c.benchmark_group("with_schema");
     group.throughput(Throughput::Elements(TOTAL_MSGS));
 
-    group.bench_function("sustained_load_100x10", |b| {
+    group.bench_function("load_100x10", |b| {
         b.iter(|| {
             rt.block_on(async {
                 for _ in 0..MSGS_PER_CONN {
@@ -515,13 +693,17 @@ fn bench_sustained_load_100x10_validated(c: &mut Criterion) {
 
 criterion_group!(
     benches,
-    // No-validation benchmarks
-    bench_single_connection_1k,
-    bench_sustained_load_4x250,
-    bench_sustained_load_100x10,
-    // With-validation benchmarks
-    bench_single_connection_1k_validated,
-    bench_sustained_load_4x250_validated,
-    bench_sustained_load_100x10_validated,
+    // No-schema stream benchmarks
+    bench_load_1x1000,
+    bench_load_4x250,
+    bench_load_100x10,
+    // No-schema datagram benchmarks
+    bench_load_1x1000_dgram,
+    bench_load_4x250_dgram,
+    bench_load_100x10_dgram,
+    // With-schema stream benchmarks
+    bench_load_1x1000_validated,
+    bench_load_4x250_validated,
+    bench_load_100x10_validated,
 );
 criterion_main!(benches);
