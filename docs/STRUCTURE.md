@@ -41,7 +41,8 @@ logfence/
 │   │       ├── builder.rs            MessageBuilder fluent API — assembles a SyslogMessage
 │   │       │                         with typed kv() calls and validates the JSON payload.
 │   │       │                         Also exports now_rfc3339() timestamp helper.
-│   │       ├── transport.rs          Transport trait + UnixTransport and UdpTransport impls.
+│   │       ├── transport.rs          Transport trait + UnixTransport (stream, octet-count framing)
+│       │                         and UnixDatagramTransport (datagram, no framing) impls.
 │   │       └── error.rs              ClientError and BuildError types.
 │   │
 │   ├── logfence-client-c/            C API wrapper for logfence-client. Depends on
@@ -76,25 +77,31 @@ logfence/
 │       ├── src/
 │       │   ├── main.rs               Entry point: clap CLI, file-aware logging setup,
 │       │   │                         schema loading, signal handling (SIGTERM/SIGHUP/
-│       │   │                         SIGUSR1), forwarder, listener, and metrics wiring.
+│       │   │                         SIGUSR1), forwarder, listener dispatch (stream or
+│       │   │                         datagram based on listen_transport), metrics wiring.
 │       │   ├── config.rs             Config structs and TOML loading/validation.
 │       │   │                         DaemonConfig, RsyslogConfig, ValidationConfig,
 │       │   │                         LoggingConfig, MetricsConfig, FramingMode,
-│       │   │                         ForwardTransport enums.
+│       │   │                         ListenTransport, ForwardTransport enums.
 │       │   ├── listener.rs           UnixListener accept loop with Semaphore-bounded
 │       │   │                         concurrency. Sets socket permissions from config.
 │       │   │                         Drains active sessions on graceful shutdown.
+│       │   ├── datagram_listener.rs  UnixDatagram receive loop. Each datagram is one
+│       │   │                         complete RFC 5424 message; no framing needed.
+│       │   │                         Selected at runtime via listen_transport = "unix_dgram".
 │       │   ├── session.rs            Per-connection codec loop: read frames → validate →
 │       │   │                         forward. Increments MetricsStore counters.
 │       │   │                         Hot-reloads validator via watch::Receiver.
+│       │   │                         pub(crate) report_rejection() and handle_message()
+│       │   │                         shared with datagram_listener.
 │       │   ├── validator.rs          JSON-object check + JSON Schema validation via
 │       │   │                         jsonschema. Strict / warn / off modes.
 │       │   ├── forwarder.rs          Arc-backed Forwarder forwards to rsyslog via
 │       │   │                         unix_dgram or unix_stream.
 │       │   └── metrics.rs            AtomicU64 counters (received/forwarded/dropped/
 │       │                             errors) + Snapshot (Display + Serialize).
-│       │                             serve_stats_socket: Unix socket stats endpoint
-│       │                             gated behind --features metrics.
+│       │                             serve_stats_socket: Unix socket stats endpoint,
+│       │                             enabled at runtime via metrics.enabled = true.
 │       ├── benches/
 │       │   └── message_throughput.rs Six Criterion benchmarks in two groups
 │       │                             (no_schema and with_schema), each with 1, 4, and

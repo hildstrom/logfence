@@ -11,12 +11,6 @@ repository.workspace = true
 name = "logfenced"
 path = "src/main.rs"
 
-[features]
-## Enables the Unix socket stats endpoint (`metrics.socket`).
-## When active, `logfenced` binds an additional socket and writes a JSON
-## metrics snapshot to each connecting client.
-metrics = []
-
 [dependencies]
 logfence-proto = { path = "../logfence-proto" }
 bytes = { workspace = true }

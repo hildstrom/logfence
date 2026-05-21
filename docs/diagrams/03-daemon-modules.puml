@@ -6,7 +6,7 @@ skinparam componentStyle rectangle
 skinparam ArrowColor #444444
 skinparam BackgroundColor #FAFAFA
 
-component "main.rs\n──────────────\nCLI parsing (clap)\nConfig loading\nLogging init\nSignal handling\n(SIGTERM/SIGHUP/SIGUSR1)\nStartup orchestration" as Main #FFEECC
+component "main.rs\n──────────────\nCLI parsing (clap)\nConfig loading\nLogging init\nSignal handling\n(SIGTERM/SIGHUP/SIGUSR1)\nListener dispatch\n(stream or datagram)\nStartup orchestration" as Main #FFEECC
 
 component "config.rs\n──────────────\nDaemonConfig\nRsyslogConfig\nValidationConfig\nLoggingConfig\nMetricsConfig\nTOML deserialization\nConfig validation" as Config #DDEEFF
 
@@ -16,18 +16,22 @@ component "forwarder.rs\n──────────────\nForwarder (
 
 component "listener.rs\n──────────────\nUnixListener bind\nSocket permissions\nSemaphore (max_connections)\nAccept loop\nGraceful drain on shutdown" as Listener #FFFACC
 
-component "session.rs\n──────────────\nPer-connection loop\nOctetCountCodec decode\nDelimiterCodec decode\nValidator clone from watch\nForward on success\nMetrics increment" as Session #E8D0FF
+component "datagram_listener.rs\n──────────────\nUnixDatagram bind\nSocket permissions\nSHUT_WR (read-only)\nReceive loop\nOne msg per datagram" as DgramListener #FFFACC
 
-component "metrics.rs\n──────────────\nMetricsStore (Arc)\nAtomicU64 counters:\n  received / forwarded\n  dropped / errors\nSnapshot serialization\nStats socket (feature)" as Metrics #D0F0FF
+component "session.rs\n──────────────\nPer-connection loop\nOctetCountCodec decode\nDelimiterCodec decode\nValidator clone from watch\nForward on success\nReport rejection to rsyslog\nMetrics increment" as Session #E8D0FF
+
+component "metrics.rs\n──────────────\nMetricsStore (Arc)\nAtomicU64 counters:\n  received / forwarded\n  dropped / errors\nSnapshot serialization\nStats socket (runtime config)" as Metrics #D0F0FF
 
 Main --> Config : load & validate
 Main --> Validator : build from config\nwrap in Arc<Validator>
 Main --> Forwarder : build from RsyslogConfig
-Main --> Listener : bind socket\nstart accept loop
+Main --> Listener : bind socket\nstart accept loop\n(listen_transport=unix_stream)
+Main --> DgramListener : bind socket\nstart receive loop\n(listen_transport=unix_dgram)
 Main --> Metrics : create Arc<MetricsStore>
 Main --> Session : via watch::channel\n(validator updates)
 
 Listener --> Session : spawn task\nper accepted connection\n(semaphore-gated)
+DgramListener --> Session : handle_message()\nreport_rejection()\n(shared pub(crate) fns)
 
 Session --> Validator : clone Arc from\nwatch::Receiver
 Session --> Forwarder : forward() per\nvalid message

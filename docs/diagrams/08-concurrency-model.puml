@@ -19,21 +19,21 @@ rectangle "Tokio Runtime" {
 
   component "Arc<MetricsStore>\n──────────────\nreceived  AtomicU64\nforwarded AtomicU64\ndropped   AtomicU64\nerrors    AtomicU64" as Metrics #D0F0FF
 
-  rectangle "listener task" {
-    component "UnixListener\naccept loop" as AcceptLoop #DDEEFF
+  rectangle "listener task\n(unix_stream or unix_dgram\nselected by listen_transport)" {
+    component "UnixListener accept loop\nor UnixDatagram receive loop" as AcceptLoop #DDEEFF
   }
 
   rectangle "session task N" as S1 {
     component "watch::Receiver\nArc<Validator> clone\n──────────────\nPer-message borrow;\nlock released before await" as WatchRx1 #DDFFD0
-    component "Codec\n(OctetCount or Delimiter)" as Codec1 #E8D0FF
+    component "Codec / datagram recv\n(OctetCount, Delimiter,\nor raw datagram)" as Codec1 #E8D0FF
   }
 
   rectangle "session task ..." as S2 {
     component "watch::Receiver\nArc<Validator> clone" as WatchRx2 #DDFFD0
-    component "Codec" as Codec2 #E8D0FF
+    component "Codec / datagram recv" as Codec2 #E8D0FF
   }
 
-  component "metrics socket task\n(optional feature)\n──────────────\nServes JSON snapshot\nper connecting client" as MetricsSock #D0F0FF
+  component "metrics socket task\n(metrics.enabled = true)\n──────────────\nServes JSON snapshot\nper connecting client" as MetricsSock #D0F0FF
 
 }
 
@@ -66,9 +66,11 @@ MetricsSock --> Metrics : snapshot()
 
 note bottom of Forwarder
   UnixStream variant uses
-  Mutex<Option<UnixStream>> for
+  Mutex<Option<OwnedWriteHalf>> for
   lazy-connect / auto-reconnect.
   Lock held only during write.
+  All sockets: SHUT_RD enforced
+  (write-only direction at OS level).
 end note
 
 note right of Watch

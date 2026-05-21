@@ -181,7 +181,11 @@ async fn run_with_codec<C>(
 /// The notice is a syslog message from logfenced itself (facility=syslog,
 /// severity=warning) whose MSG field is a JSON object describing why the
 /// client's message was dropped.
-async fn report_rejection(forwarder: &Forwarder, local_hostname: &str, payload: serde_json::Value) {
+pub(crate) async fn report_rejection(
+    forwarder: &Forwarder,
+    local_hostname: &str,
+    payload: serde_json::Value,
+) {
     use logfence_proto::syslog::{Facility, Priority, Severity};
     let report = logfence_proto::syslog::SyslogMessage {
         priority: Priority(Facility::Syslog, Severity::Warning),
@@ -198,7 +202,7 @@ async fn report_rejection(forwarder: &Forwarder, local_hostname: &str, payload: 
     }
 }
 
-async fn handle_message(
+pub(crate) async fn handle_message(
     msg: logfence_proto::syslog::SyslogMessage,
     validator_rx: &watch::Receiver<Arc<Validator>>,
     forwarder: &Forwarder,

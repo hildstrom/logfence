@@ -54,7 +54,7 @@ pub struct Config {
     #[serde(default)]
     pub logging: LoggingConfig,
 
-    /// Metrics stats socket settings (only active with the `metrics` feature).
+    /// Metrics stats socket settings.
     #[serde(default)]
     pub metrics: MetricsConfig,
 }
@@ -82,7 +82,13 @@ pub struct DaemonConfig {
     #[serde(default = "DaemonConfig::default_max_message_size")]
     pub max_message_size: usize,
 
-    /// Framing mode for incoming messages.
+    /// Transport protocol for the listening socket.
+    #[serde(default)]
+    pub listen_transport: ListenTransport,
+
+    /// Framing mode for incoming messages on a stream socket.
+    ///
+    /// Ignored when `listen_transport = "unix_dgram"`.
     #[serde(default)]
     pub framing: FramingMode,
 
@@ -117,13 +123,30 @@ impl Default for DaemonConfig {
             socket_group: None,
             max_connections: Self::default_max_connections(),
             max_message_size: Self::default_max_message_size(),
+            listen_transport: ListenTransport::default(),
             framing: FramingMode::default(),
             sender: SenderMode::default(),
         }
     }
 }
 
+/// Transport protocol for the daemon's listening socket.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ListenTransport {
+    /// Unix stream socket (default). Clients maintain a persistent connection
+    /// and messages use RFC 6587 octet-count or newline framing.
+    #[default]
+    UnixStream,
+    /// Unix datagram socket. Each datagram is one complete, unframed RFC 5424
+    /// message. This matches rsyslog's standard `imuxsock` input mode and
+    /// makes logfenced a drop-in man-in-the-middle for syslog clients.
+    UnixDgram,
+}
+
 /// Framing protocol for the incoming Unix stream socket.
+///
+/// Only relevant when `listen_transport = "unix_stream"`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FramingMode {
@@ -262,13 +285,17 @@ pub enum ValidationMode {
     Off,
 }
 
-/// Settings for the optional metrics stats socket.
-///
-/// The socket is only created when the `metrics` Cargo feature is enabled.
-/// The config section is always parsed so the same config file works with
-/// both feature-enabled and feature-disabled builds.
+/// Settings for the metrics stats socket.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MetricsConfig {
+    /// Enable the metrics stats socket.
+    ///
+    /// When `true`, logfenced binds `socket` and serves a JSON
+    /// [`metrics::Snapshot`](crate::metrics::Snapshot) to each connecting
+    /// client before closing the connection.
+    #[serde(default)]
+    pub enabled: bool,
+
     /// Path for the Unix stream socket that serves JSON metrics snapshots.
     #[serde(default = "MetricsConfig::default_socket")]
     pub socket: String,
@@ -283,6 +310,7 @@ impl MetricsConfig {
 impl Default for MetricsConfig {
     fn default() -> Self {
         Self {
+            enabled: false,
             socket: Self::default_socket(),
         }
     }
@@ -606,5 +634,37 @@ output_cee = "optional"
         );
         let cfg = load(f.path()).unwrap();
         assert_eq!(cfg.daemon.sender, SenderMode::Original);
+    }
+
+    #[test]
+    fn listen_transport_defaults_to_unix_stream() {
+        let f = write_toml("[daemon]\nlisten_socket = \"/tmp/t.sock\"\n\n[rsyslog]\n");
+        let cfg = load(f.path()).unwrap();
+        assert_eq!(cfg.daemon.listen_transport, ListenTransport::UnixStream);
+    }
+
+    #[test]
+    fn listen_transport_unix_dgram_parses() {
+        let f = write_toml(
+            "[daemon]\nlisten_socket = \"/tmp/t.sock\"\nlisten_transport = \"unix_dgram\"\n\n[rsyslog]\n",
+        );
+        let cfg = load(f.path()).unwrap();
+        assert_eq!(cfg.daemon.listen_transport, ListenTransport::UnixDgram);
+    }
+
+    #[test]
+    fn metrics_enabled_defaults_to_false() {
+        let f = write_toml("[daemon]\nlisten_socket = \"/tmp/t.sock\"\n\n[rsyslog]\n");
+        let cfg = load(f.path()).unwrap();
+        assert!(!cfg.metrics.enabled);
+    }
+
+    #[test]
+    fn metrics_enabled_parses() {
+        let f = write_toml(
+            "[daemon]\nlisten_socket = \"/tmp/t.sock\"\n\n[rsyslog]\n\n[metrics]\nenabled = true\n",
+        );
+        let cfg = load(f.path()).unwrap();
+        assert!(cfg.metrics.enabled);
     }
 }

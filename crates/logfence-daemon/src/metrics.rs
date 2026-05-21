@@ -112,7 +112,6 @@ impl fmt::Display for Snapshot {
 /// never reads from it.  Calling `shutdown(SHUT_RD)` makes that invariant
 /// explicit at the OS level; keeping only `OwnedWriteHalf` enforces it at the
 /// type level.
-#[cfg(feature = "metrics")]
 fn metrics_write_half(
     stream: tokio::net::UnixStream,
 ) -> std::io::Result<tokio::net::unix::OwnedWriteHalf> {
@@ -123,7 +122,6 @@ fn metrics_write_half(
     Ok(write_half)
 }
 
-#[cfg(feature = "metrics")]
 pub async fn serve_stats_socket(
     path: String,
     store: Arc<MetricsStore>,
@@ -252,7 +250,6 @@ mod tests {
         assert_eq!(snap.forwarded, 1);
     }
 
-    #[cfg(feature = "metrics")]
     #[tokio::test]
     async fn stats_socket_serves_json() {
         use std::time::Duration;

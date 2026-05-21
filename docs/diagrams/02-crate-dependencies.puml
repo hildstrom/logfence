@@ -19,6 +19,7 @@ package "logfence workspace" {
   package "logfence-client" <<crate>> #DDFFD0 {
     [MessageBuilder\n(fluent API)]
     [UnixTransport\n(stream socket)]
+    [UnixDatagramTransport\n(datagram socket)]
     [Transport trait\n(async send)]
     [CEE_COOKIE constant]
     [now_rfc3339()]
@@ -30,6 +31,7 @@ package "logfence workspace" {
     [forwarder.rs]
     [session.rs]
     [listener.rs]
+    [datagram_listener.rs]
     [metrics.rs]
     [main.rs]
   }

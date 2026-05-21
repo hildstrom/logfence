@@ -17,7 +17,7 @@ database "JSON Schema\nfiles" as Schemas
 component "Log Storage /\nNetwork Targets" as Storage
 
 App --> Client : calls MessageBuilder API
-Client --> Daemon : RFC 5424 + JSON payload\nUnix stream socket\nOctet-count framing
+Client --> Daemon : RFC 5424 + JSON payload\nUnix stream socket (octet-count framed)\nor Unix datagram socket (one msg/datagram)
 Daemon ..> Schemas : reads at startup\n& on SIGHUP
 Daemon --> Rsyslog : validated messages\nUnix datagram or stream socket\nRFC 5424 wire format
 Rsyslog --> Storage : forwards to files,\nnetwork, etc.
@@ -25,6 +25,8 @@ Rsyslog --> Storage : forwards to files,\nnetwork, etc.
 note right of Client
   Encodes syslog header fields
   Serializes key-value pairs to JSON
+  UnixTransport: stream + octet-count framing
+  UnixDatagramTransport: datagram, no framing
   Lazily connects; auto-reconnects
 end note
 
@@ -34,13 +36,14 @@ note right of Daemon
   Applies CEE cookie policy
   Canonicalizes JSON (optional)
   Drops invalid messages
+  Reports rejections to rsyslog
 end note
 
 note bottom of Daemon
-  Invalid messages are dropped
-  and an error is reported to
-  rsyslog — they never reach
-  downstream consumers.
+  Invalid messages are dropped and a
+  rejection report is forwarded to rsyslog
+  as a warning from logfenced — they never
+  reach downstream consumers.
 end note
 
 @enduml

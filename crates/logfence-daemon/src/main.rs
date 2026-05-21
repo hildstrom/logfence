@@ -23,6 +23,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 mod config;
+mod datagram_listener;
 mod forwarder;
 mod listener;
 mod metrics;
@@ -75,7 +76,8 @@ async fn main() -> ExitCode {
 
     info!(
         socket = %cfg.daemon.listen_socket,
-        transport = ?cfg.rsyslog.transport,
+        listen_transport = ?cfg.daemon.listen_transport,
+        forward_transport = ?cfg.rsyslog.transport,
         validation = ?cfg.validation.mode,
         "logfenced starting"
     );
@@ -105,28 +107,43 @@ async fn main() -> ExitCode {
         }
     };
 
-    // Bind the listening socket.
-    let listener = match listener::Listener::bind(cfg.daemon, forwarder) {
-        Ok(l) => l,
-        Err(e) => {
-            error!(error = %e, "failed to bind socket");
-            return ExitCode::FAILURE;
-        }
-    };
+    let listen_transport = cfg.daemon.listen_transport;
 
     let shutdown = CancellationToken::new();
 
-    // Optional metrics stats socket (compiled in with --features metrics).
-    #[cfg(feature = "metrics")]
-    tokio::spawn(metrics::serve_stats_socket(
-        cfg.metrics.socket.clone(),
-        Arc::clone(&store),
-        shutdown.child_token(),
-    ));
+    // Optional metrics stats socket.
+    if cfg.metrics.enabled {
+        tokio::spawn(metrics::serve_stats_socket(
+            cfg.metrics.socket.clone(),
+            Arc::clone(&store),
+            shutdown.child_token(),
+        ));
+    }
 
-    // Spawn the accept loop as a task so the signal handler can run concurrently.
-    let listener_task =
-        tokio::spawn(listener.run(shutdown.child_token(), validator_rx, Arc::clone(&store)));
+    // Bind the listening socket and spawn the accept loop as a task so the
+    // signal handler can run concurrently.
+    let listener_task = match listen_transport {
+        config::ListenTransport::UnixStream => {
+            let listener = match listener::Listener::bind(cfg.daemon, forwarder) {
+                Ok(l) => l,
+                Err(e) => {
+                    error!(error = %e, "failed to bind socket");
+                    return ExitCode::FAILURE;
+                }
+            };
+            tokio::spawn(listener.run(shutdown.child_token(), validator_rx, Arc::clone(&store)))
+        }
+        config::ListenTransport::UnixDgram => {
+            let listener = match datagram_listener::DatagramListener::bind(cfg.daemon, forwarder) {
+                Ok(l) => l,
+                Err(e) => {
+                    error!(error = %e, "failed to bind socket");
+                    return ExitCode::FAILURE;
+                }
+            };
+            tokio::spawn(listener.run(shutdown.child_token(), validator_rx, Arc::clone(&store)))
+        }
+    };
 
     // Block until SIGTERM (or Ctrl-C on non-Unix), handling SIGHUP / SIGUSR1.
     handle_signals(

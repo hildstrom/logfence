@@ -66,15 +66,18 @@ policy cross the boundary.
   dropping any connections
 - Metrics: atomic counters for received, forwarded, dropped, and error counts;
   query with `SIGUSR1` (logged) or via an optional Unix stream stats socket
-  (`--features metrics`)
+  (enabled with `metrics.enabled = true` in config)
 - Configurable maximum connections (semaphore-bounded), message size, socket
   permissions, and socket group
 - Structured daemon logging via `tracing` to stderr or a file
 
 **Transport**
 - Accepts connections on a Unix stream socket with RFC 6587 octet-count or
-  newline framing
+  newline framing, or a Unix datagram socket (one datagram per message; drop-in
+  for rsyslog's standard `imuxsock` datagram input)
 - Forwards to rsyslog via Unix datagram socket (default) or Unix stream socket
+- Socket directionality enforced at both the OS level (`SHUT_RD`/`SHUT_WR`) and
+  the type level (`OwnedReadHalf`/`OwnedWriteHalf`) on every socket
 
 ---
 
@@ -84,10 +87,11 @@ policy cross the boundary.
 Application
   │  logfence-client (Rust library)
   │  MessageBuilder → JSON key-value pairs → RFC 5424 frame
-  │  Unix stream socket  (octet-count framed)
+  │  Unix stream socket (octet-count framed)  ─── or ───  Unix datagram socket
   ▼
 logfenced (daemon)
   │  Decode → Validate (JSON + Schema) → Transform → Forward
+  │  (invalid messages dropped; rejection reported to rsyslog)
   │  Unix datagram or stream socket  (RFC 5424 wire format)
   ▼
 rsyslog
@@ -98,7 +102,7 @@ logfence is composed of four crates:
 | Crate | Role |
 |---|---|
 | `logfence-proto` | RFC 5424 types (`SyslogMessage`, `Facility`, `Severity`) and framing codecs (`OctetCountCodec`, `DelimiterCodec`) |
-| `logfence-client` | `MessageBuilder` fluent API and `UnixTransport` for applications sending structured log messages |
+| `logfence-client` | `MessageBuilder` fluent API, `UnixTransport` (stream), and `UnixDatagramTransport` for applications sending structured log messages |
 | `logfence-client-c` | Simple `logfence-client` C API wrapper for C applications sending structured log messages |
 | `logfence-daemon` | The `logfenced` daemon: config, validation, forwarding, metrics, signal handling |
 

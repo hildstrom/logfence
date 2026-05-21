@@ -32,7 +32,7 @@ JALoP is substantially more complex:
 - **Protocol** — JALoP 1.x uses BEEP (RFC 3080) for network transport, a
   multi-channel, session-oriented protocol with its own framing, error handling,
   and channel management. JALoP 2.x replaced BEEP with HTTPS. logfence uses
-  plain Unix stream sockets with RFC 6587 octet-count framing.
+  plain Unix domain sockets (stream with RFC 6587 framing, or datagram).
 - **Record format** — JALoP wraps log records in XML envelopes with metadata
   headers, digest values, and signature blocks. logfence uses RFC 5424 syslog
   with a JSON payload — both are existing standards, nothing proprietary.

@@ -90,10 +90,21 @@ package "logfence-client" #DDFFD0 {
   class UnixTransport {
     - path: PathBuf
     - max_size: usize
-    - stream: Mutex<Option<UnixStream>>
+    - stream: Mutex<Option<OwnedWriteHalf>>
     --
     + new(path, max_size) -> Self
     + send(msg) -> Result<()>
+    note: SHUT_RD on connect;\nwrite-only direction enforced
+  }
+
+  class UnixDatagramTransport {
+    - path: PathBuf
+    - max_size: usize
+    - socket: Mutex<Option<UnixDatagram>>
+    --
+    + new(path, max_size) -> Self
+    + send(msg) -> Result<()>
+    note: SHUT_RD on creation;\nno framing; send_to() per msg
   }
 
   interface Transport <<trait>> {
@@ -102,6 +113,7 @@ package "logfence-client" #DDFFD0 {
 
   MessageBuilder ..> SyslogMessage : builds
   UnixTransport ..|> Transport
+  UnixDatagramTransport ..|> Transport
   MessageBuilder ..> Transport : .send()
 }
 
@@ -143,6 +155,11 @@ package "logfence-daemon" #FFEECC {
     Always
   }
 
+  enum ListenTransport {
+    UnixStream
+    UnixDgram
+  }
+
   class Forwarder {
     - inner: Arc<Inner>
     --
@@ -157,7 +174,8 @@ package "logfence-daemon" #FFEECC {
 
   class "Inner (UnixStream)" as InnerStream {
     - path: String
-    - stream: Mutex<Option<UnixStream>>
+    - stream: Mutex<Option<OwnedWriteHalf>>
+    note: SHUT_RD on connect;\nwrite-only direction enforced
   }
 
   class MetricsStore {

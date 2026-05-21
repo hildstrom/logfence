@@ -7,11 +7,14 @@
 //! # Quick start
 //!
 //! ```rust,no_run
-//! use logfence_client::{MessageBuilder, UnixTransport, now_rfc3339};
+//! use logfence_client::{MessageBuilder, UnixTransport, UnixDatagramTransport, now_rfc3339};
 //! use logfence_proto::syslog::{Facility, Severity};
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! // Stream transport (octet-count framing) — for logfenced or rsyslog imuxsock stream.
 //! let transport = UnixTransport::new("/run/logfenced/logfenced.sock", 65536);
+//! // Datagram transport — for rsyslog imuxsock datagram or logfenced unix_dgram mode.
+//! // let transport = UnixDatagramTransport::new("/run/syslog", 65536);
 //!
 //! MessageBuilder::new(Facility::Local0, Severity::Info)
 //!     .timestamp(now_rfc3339())
@@ -34,4 +37,4 @@ pub mod transport;
 
 pub use builder::{now_rfc3339, MessageBuilder};
 pub use error::{BuildError, ClientError};
-pub use transport::{Transport, UnixTransport};
+pub use transport::{Transport, UnixDatagramTransport, UnixTransport};

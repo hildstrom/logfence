@@ -1,16 +1,24 @@
-//! Transport trait and implementation for delivering syslog messages.
+//! Transport trait and implementations for delivering syslog messages.
 //!
-//! One transport is provided:
+//! Two transports are provided:
 //!
 //! - [`UnixTransport`] — connects to a Unix stream socket and sends messages
 //!   using RFC 6587 §3.4.1 octet-count framing. This is the correct transport
 //!   for talking to a running `logfenced` daemon or to rsyslog's `imuxsock`.
 //!   The connection is established lazily on first send and re-established
 //!   automatically after any I/O error.
+//!
+//! - [`UnixDatagramTransport`] — sends each message as a single datagram to a
+//!   Unix socket. This is the correct transport for talking to rsyslog's
+//!   standard `imuxsock` datagram input, or to a `logfenced` instance
+//!   configured with `listen_transport = "unix_dgram"`. No framing is added;
+//!   the datagram boundary is the message boundary.
 
 use std::path::PathBuf;
 
-use tokio::{io::AsyncWriteExt, net::unix::OwnedWriteHalf, net::UnixStream, sync::Mutex};
+use tokio::{
+    io::AsyncWriteExt, net::unix::OwnedWriteHalf, net::UnixDatagram, net::UnixStream, sync::Mutex,
+};
 
 use logfence_proto::syslog::SyslogMessage;
 
@@ -115,6 +123,78 @@ impl Transport for UnixTransport {
     }
 }
 
+// ── UnixDatagramTransport ─────────────────────────────────────────────────────
+
+/// Write-only Unix datagram transport.
+///
+/// Sends each [`SyslogMessage`] as a single datagram to the configured socket
+/// path.  This matches the framing expected by rsyslog's `imuxsock` datagram
+/// input and by a `logfenced` instance configured with
+/// `listen_transport = "unix_dgram"`.
+///
+/// The socket is created unbound and its read half is shut down (`SHUT_RD`)
+/// immediately, enforcing write-only direction at both the type level and the
+/// OS level.  There is no framing — the datagram boundary is the message
+/// boundary.
+///
+/// Thread-safe: the socket is protected by a [`tokio::sync::Mutex`].
+pub struct UnixDatagramTransport {
+    path: PathBuf,
+    max_size: usize,
+    socket: Mutex<Option<UnixDatagram>>,
+}
+
+impl UnixDatagramTransport {
+    /// Create a transport that will send to the Unix datagram socket at `path`.
+    ///
+    /// `max_size` is the maximum accepted wire message size in bytes.
+    /// Use `65536` for the standard datagram limit.
+    #[must_use]
+    pub fn new(path: impl Into<PathBuf>, max_size: usize) -> Self {
+        Self {
+            path: path.into(),
+            max_size,
+            socket: Mutex::new(None),
+        }
+    }
+}
+
+impl Transport for UnixDatagramTransport {
+    async fn send(&self, msg: &SyslogMessage) -> Result<(), ClientError> {
+        let wire = msg.to_string();
+        if wire.len() > self.max_size {
+            return Err(ClientError::MessageTooLarge {
+                max: self.max_size,
+                got: wire.len(),
+            });
+        }
+
+        let mut guard = self.socket.lock().await;
+
+        if guard.is_none() {
+            // Create an unbound socket and enforce write-only direction.
+            let sock = UnixDatagram::unbound()?;
+            sock.shutdown(std::net::Shutdown::Read)?;
+            *guard = Some(sock);
+        }
+
+        // `guard` is `Some` — we just set it above if it was `None`.
+        let Some(sock) = guard.as_ref() else {
+            return Err(ClientError::Io(std::io::Error::other(
+                "internal: Unix datagram socket not initialised",
+            )));
+        };
+
+        if let Err(e) = sock.send_to(wire.as_bytes(), &self.path).await {
+            // Drop the socket; next call will recreate it.
+            *guard = None;
+            return Err(ClientError::Io(e));
+        }
+
+        Ok(())
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -205,6 +285,39 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sock_path = dir.path().join("oversize.sock");
         let transport = UnixTransport::new(&sock_path, 10); // tiny limit
+
+        let err = transport.send(&sample_msg()).await.unwrap_err();
+        assert!(matches!(err, ClientError::MessageTooLarge { .. }));
+    }
+
+    #[tokio::test]
+    async fn unix_datagram_transport_sends_raw_wire() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("dgram.sock");
+        let receiver = UnixDatagram::bind(&sock_path).unwrap();
+
+        let transport = UnixDatagramTransport::new(&sock_path, 65536);
+        let msg = sample_msg();
+        let expected_wire = msg.to_string();
+
+        transport.send(&msg).await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(1), receiver.recv(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let received = std::str::from_utf8(&buf[..n]).unwrap();
+
+        // No framing — the raw RFC 5424 wire format is sent as-is.
+        assert_eq!(received, expected_wire);
+    }
+
+    #[tokio::test]
+    async fn unix_datagram_transport_rejects_oversized_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("oversize_dgram.sock");
+        let transport = UnixDatagramTransport::new(&sock_path, 10); // tiny limit
 
         let err = transport.send(&sample_msg()).await.unwrap_err();
         assert!(matches!(err, ClientError::MessageTooLarge { .. }));

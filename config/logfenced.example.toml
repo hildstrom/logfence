@@ -12,7 +12,13 @@ socket_mode = "0660"
 max_connections = 256
 # Maximum accepted syslog message size in bytes.
 max_message_size = 65536
+# Transport protocol for the listening socket.
+# "unix_stream" — persistent connections with RFC 6587 framing (default).
+# "unix_dgram"  — one datagram per message; no framing; drop-in for rsyslog imuxsock.
+# listen_transport = "unix_stream"
+
 # Framing mode for the incoming Unix stream socket.
+# Only relevant when listen_transport = "unix_stream".
 # "octet_count" — RFC 6587 §3.4.1 (preferred; handles embedded newlines in JSON)
 # "newline"     — one message per line (simpler clients)
 framing = "octet_count"
@@ -117,7 +123,9 @@ level = "info"
 output = "stderr"
 
 [metrics]
-# Unix stream socket that serves a JSON metrics snapshot to each connecting
-# client. Only active when logfenced is compiled with --features metrics.
+# Set enabled = true to activate the metrics stats socket.
+# When enabled, logfenced binds `socket` and writes a JSON snapshot to each
+# connecting client, then closes the connection immediately.
 # Query with: socat - UNIX-CONNECT:/run/logfenced/logfenced.stats.sock
+# enabled = false
 socket = "/run/logfenced/logfenced.stats.sock"

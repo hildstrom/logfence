@@ -153,7 +153,7 @@ impl Listener {
 ///
 /// Returns `"-"` (the RFC 5424 nil value) when the file is absent or empty,
 /// which covers macOS in development environments.
-fn detect_hostname() -> Arc<str> {
+pub(crate) fn detect_hostname() -> Arc<str> {
     std::fs::read_to_string("/etc/hostname")
         .map(|s| s.trim().to_owned())
         .ok()
@@ -162,7 +162,7 @@ fn detect_hostname() -> Arc<str> {
         .into()
 }
 
-fn apply_socket_permissions(path: &Path, mode_str: &str) -> std::io::Result<()> {
+pub(crate) fn apply_socket_permissions(path: &Path, mode_str: &str) -> std::io::Result<()> {
     let trimmed = mode_str.trim_start_matches('0');
     let trimmed = if trimmed.is_empty() { "0" } else { trimmed };
     let mode = u32::from_str_radix(trimmed, 8).unwrap_or_else(|_| {
