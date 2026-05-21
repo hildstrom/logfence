@@ -79,12 +79,21 @@ the bottleneck at that point rather than connection fan-in.
 The datagram path is roughly 3–4× slower than the stream path.  Two structural
 differences drive this:
 
-**No send-side buffering.**  With a stream socket, the kernel can absorb many
-frames into the connection's send buffer before the daemon calls the next
-`recv`.  The client's `write_all` calls return as soon as bytes are in the
-buffer.  With datagrams, each `send_to` delivers a message atomically;
-throughput is bounded by the rate at which the daemon calls `recv_from` and
-processes each message end-to-end before the next receive.
+**Per-message syscall on receive.**  With a stream socket, a single `read()`
+syscall can return tens of kilobytes covering dozens of framed messages.  The
+codec decodes all of them from its buffer without touching the OS again,
+amortising I/O overhead across many messages.  With datagrams, each message
+requires its own `recv_from()` syscall — the datagram boundary is the syscall
+boundary — so syscall overhead scales linearly with message count rather than
+being amortised.
+
+Note that the output datagram socket (daemon → rsyslog) does not face this
+constraint in the stream-input benchmarks: the mock rsyslog socket has a 1 MB
+receive buffer and a dedicated drainer thread, so the daemon's `send_to()` calls
+return immediately without waiting for the receiver.  The output datagram is
+non-blocking in practice; it is not the bottleneck.  The datagram *input* path
+has no equivalent buffering benefit because the daemon cannot batch `recv_from`
+calls.
 
 **Flat fan-in.**  The stream listener spawns a separate Tokio task per
 connection, so 4 or 100 sessions execute concurrently and overlap I/O and
