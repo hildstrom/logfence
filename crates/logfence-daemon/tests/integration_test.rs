@@ -180,6 +180,20 @@ impl Fixture {
             .map(|n| String::from_utf8_lossy(&buf[..n]).into_owned())
     }
 
+    /// Receive and assert the next datagram is a rejection report that logfenced
+    /// sent in response to an invalid message.
+    async fn recv_rejection(&self) -> String {
+        let msg = self
+            .try_recv()
+            .await
+            .expect("expected a rejection report at rsyslog, got timeout");
+        assert!(
+            msg.contains("message_dropped"),
+            "expected rejection report, got: {msg}"
+        );
+        msg
+    }
+
     /// Send SIGTERM and wait up to 5 s for the process to exit cleanly.
     async fn shutdown(mut self) {
         self.send_sigterm();
@@ -277,10 +291,8 @@ async fn schema_rejects_invalid_and_passes_valid() {
         .await
         .expect("send non-conforming message");
 
-    assert!(
-        f.try_recv().await.is_none(),
-        "non-conforming message should have been dropped by strict validator"
-    );
+    // The daemon drops the invalid message and sends a rejection report to rsyslog.
+    f.recv_rejection().await;
 
     // Message with the required "event" field → must be forwarded.
     send_event(&f.listen_path, "audit").await;
@@ -342,10 +354,8 @@ async fn sighup_reloads_schema() {
         .send(&transport)
         .await
         .expect("send non-conforming after reload");
-    assert!(
-        f.try_recv().await.is_none(),
-        "non-conforming message should be dropped after SIGHUP reload"
-    );
+    // The daemon drops the invalid message and sends a rejection report to rsyslog.
+    f.recv_rejection().await;
 
     // Message with the required "event" field must now pass.
     send_event(&f.listen_path, "post-reload").await;
@@ -490,10 +500,8 @@ async fn logger_non_json_message_dropped() {
         .expect("run logger");
     assert!(status.success(), "logger exited with non-zero status");
 
-    assert!(
-        f.try_recv().await.is_none(),
-        "non-JSON message should have been dropped by the validator"
-    );
+    // The daemon drops the invalid message and sends a rejection report to rsyslog.
+    f.recv_rejection().await;
 
     f.shutdown().await;
 }
@@ -508,10 +516,8 @@ async fn cee_input_required_rejects_plain_json() {
 
     send_event(&f.listen_path, "no-cookie").await;
 
-    assert!(
-        f.try_recv().await.is_none(),
-        "plain JSON should be dropped when input_cee = always"
-    );
+    // The daemon drops the message and sends a rejection report to rsyslog.
+    f.recv_rejection().await;
 
     f.shutdown().await;
 }
@@ -790,11 +796,8 @@ async fn c_api_schema_rejects_noncompliant_json() {
     // The message reached the daemon socket (transport succeeded).
     assert_eq!(rc, LF_OK, "lf_send should return LF_OK (got {rc})");
 
-    // The daemon must have dropped it — nothing should arrive at mock rsyslog.
-    assert!(
-        f.try_recv().await.is_none(),
-        "message failing schema validation should be dropped by the daemon"
-    );
+    // The daemon dropped it and sent a rejection report to rsyslog.
+    f.recv_rejection().await;
 
     f.shutdown().await;
 }

@@ -124,6 +124,7 @@ impl Listener {
                 max_message_size: cfg.max_message_size,
                 sender_mode: cfg.sender,
                 local_hostname: Arc::clone(&local_hostname),
+                peer: Arc::from(peer.as_str()),
             };
             let vr = validator_rx.clone();
             let fwd = forwarder.clone();

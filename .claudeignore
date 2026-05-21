@@ -1,3 +1,4 @@
-*.claude.txt
+*.claudeignore.txt
 /target/
 .DS_Store
+/.git

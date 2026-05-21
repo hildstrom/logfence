@@ -105,6 +105,24 @@ impl fmt::Display for Snapshot {
 /// `shutdown` is cancelled.
 ///
 /// Only compiled when the `metrics` Cargo feature is enabled.
+/// Shut down the read half of an accepted metrics connection and return only
+/// the write half.
+///
+/// The metrics socket is write-only from the daemon's perspective: logfenced
+/// never reads from it.  Calling `shutdown(SHUT_RD)` makes that invariant
+/// explicit at the OS level; keeping only `OwnedWriteHalf` enforces it at the
+/// type level.
+#[cfg(feature = "metrics")]
+fn metrics_write_half(
+    stream: tokio::net::UnixStream,
+) -> std::io::Result<tokio::net::unix::OwnedWriteHalf> {
+    let std_stream = stream.into_std()?;
+    std_stream.shutdown(std::net::Shutdown::Read)?;
+    let stream = tokio::net::UnixStream::from_std(std_stream)?;
+    let (_, write_half) = stream.into_split();
+    Ok(write_half)
+}
+
 #[cfg(feature = "metrics")]
 pub async fn serve_stats_socket(
     path: String,
@@ -125,7 +143,7 @@ pub async fn serve_stats_socket(
     info!(socket = %path, "metrics socket listening");
 
     loop {
-        let mut stream = tokio::select! {
+        let stream = tokio::select! {
             biased;
             () = shutdown.cancelled() => break,
             result = listener.accept() => match result {
@@ -137,6 +155,15 @@ pub async fn serve_stats_socket(
             },
         };
 
+        // Enforce write-only direction before doing anything with the socket.
+        let mut write_half = match metrics_write_half(stream) {
+            Ok(w) => w,
+            Err(e) => {
+                error!(error = %e, "failed to enforce write-only on metrics connection");
+                continue;
+            }
+        };
+
         let snapshot = store.snapshot();
         let line = match serde_json::to_string(&snapshot) {
             Ok(s) => format!("{s}\n"),
@@ -145,7 +172,7 @@ pub async fn serve_stats_socket(
                 continue;
             }
         };
-        if let Err(e) = stream.write_all(line.as_bytes()).await {
+        if let Err(e) = write_half.write_all(line.as_bytes()).await {
             error!(error = %e, "failed to write metrics response");
         }
     }

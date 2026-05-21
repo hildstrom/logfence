@@ -7,7 +7,9 @@
 use std::sync::Arc;
 
 use bytes::BytesMut;
+use serde_json::json;
 use tokio::io::AsyncReadExt;
+use tokio::net::unix::OwnedReadHalf;
 use tokio::net::UnixStream;
 use tokio::sync::watch;
 use tokio_util::codec::Decoder;
@@ -35,6 +37,9 @@ pub struct SessionConfig {
     pub sender_mode: SenderMode,
     /// Local hostname reported as sender when `sender_mode` is `Logfenced`.
     pub local_hostname: Arc<str>,
+    /// Socket path (or `"<anonymous>"`) of the connecting client, used in
+    /// rejection reports forwarded to rsyslog.
+    pub peer: Arc<str>,
 }
 
 // ── Sender rewrite ────────────────────────────────────────────────────────────
@@ -97,20 +102,25 @@ pub async fn run_session(
     forwarder: Forwarder,
     metrics: Arc<MetricsStore>,
 ) {
+    // Enforce read-only direction on this socket: logfenced only reads from
+    // client connections and must never write back.  Dropping the write half
+    // calls shutdown(SHUT_WR) at the OS level, making any accidental write
+    // attempt fail immediately.
+    let (read_half, _write_half) = stream.into_split();
     match cfg.framing {
         FramingMode::OctetCount => {
             let codec = OctetCountCodec::new(cfg.max_message_size);
-            run_with_codec(stream, codec, cfg, validator_rx, forwarder, metrics).await;
+            run_with_codec(read_half, codec, cfg, validator_rx, forwarder, metrics).await;
         }
         FramingMode::Newline => {
             let codec = DelimiterCodec::newline(cfg.max_message_size);
-            run_with_codec(stream, codec, cfg, validator_rx, forwarder, metrics).await;
+            run_with_codec(read_half, codec, cfg, validator_rx, forwarder, metrics).await;
         }
     }
 }
 
 async fn run_with_codec<C>(
-    mut stream: UnixStream,
+    mut stream: OwnedReadHalf,
     mut codec: C,
     cfg: SessionConfig,
     validator_rx: watch::Receiver<Arc<Validator>>,
@@ -130,7 +140,7 @@ async fn run_with_codec<C>(
             }
             Ok(None) => {} // Need more bytes.
             Err(e) => {
-                handle_frame_error(e);
+                handle_frame_error(e, &forwarder, &cfg).await;
                 // Clear the buffer so we don't get stuck on bad bytes.
                 // The connection stays open; the next read may recover.
                 buf.clear();
@@ -155,7 +165,7 @@ async fn run_with_codec<C>(
                     }
                     Ok(None) => break,
                     Err(e) => {
-                        handle_frame_error(e);
+                        handle_frame_error(e, &forwarder, &cfg).await;
                         break;
                     }
                 }
@@ -163,6 +173,28 @@ async fn run_with_codec<C>(
             debug!("client disconnected");
             return;
         }
+    }
+}
+
+/// Build and forward a rejection notice to rsyslog.
+///
+/// The notice is a syslog message from logfenced itself (facility=syslog,
+/// severity=warning) whose MSG field is a JSON object describing why the
+/// client's message was dropped.
+async fn report_rejection(forwarder: &Forwarder, local_hostname: &str, payload: serde_json::Value) {
+    use logfence_proto::syslog::{Facility, Priority, Severity};
+    let report = logfence_proto::syslog::SyslogMessage {
+        priority: Priority(Facility::Syslog, Severity::Warning),
+        timestamp: None,
+        hostname: Some(local_hostname.to_owned()),
+        app_name: Some("logfenced".to_owned()),
+        proc_id: Some(std::process::id().to_string()),
+        msg_id: None,
+        structured_data: "-".to_owned(),
+        msg: payload.to_string(),
+    };
+    if let Err(e) = forwarder.forward(&report).await {
+        error!(error = %e, "failed to report rejection to rsyslog");
     }
 }
 
@@ -180,6 +212,15 @@ async fn handle_message(
     if let Err(e) = validator.validate(&msg) {
         warn!(error = %e, "dropping invalid message");
         metrics.inc_dropped();
+        let payload = json!({
+            "event": "message_dropped",
+            "peer": cfg.peer.as_ref(),
+            "sender_hostname": msg.hostname.as_deref().unwrap_or("-"),
+            "sender_app": msg.app_name.as_deref().unwrap_or("-"),
+            "sender_pid": msg.proc_id.as_deref().unwrap_or("-"),
+            "error": e.to_string(),
+        });
+        report_rejection(forwarder, &cfg.local_hostname, payload).await;
         return;
     }
     let prepared = validator.prepare_for_forwarding(&msg);
@@ -198,26 +239,42 @@ async fn handle_message(
     }
 }
 
-fn handle_frame_error(e: FrameError) {
-    match e {
+async fn handle_frame_error(e: FrameError, forwarder: &Forwarder, cfg: &SessionConfig) {
+    // Returns Some(description) for dropped-message errors that should be
+    // reported to rsyslog, or None for infrastructure errors (I/O).
+    let problem: Option<String> = match &e {
         FrameError::MessageTooLarge { max, got } => {
             warn!(max, got, "dropping oversized message");
+            Some(format!("oversized message: got {got} bytes, max {max}"))
         }
         FrameError::InvalidOctetCount => {
             warn!("dropping message with invalid octet count");
+            Some("invalid octet count".to_owned())
         }
         FrameError::InvalidUtf8 => {
             warn!("dropping message with invalid UTF-8");
+            Some("invalid UTF-8 encoding".to_owned())
         }
         FrameError::OctetCountPrefixTooLong => {
             warn!("dropping message with excessively long octet count prefix");
+            Some("octet count prefix too long".to_owned())
         }
-        FrameError::Parse(e) => {
-            warn!(error = %e, "dropping message with parse error");
+        FrameError::Parse(inner) => {
+            warn!(error = %inner, "dropping message with parse error");
+            Some(format!("syslog parse error: {inner}"))
         }
-        FrameError::Io(e) => {
-            error!(error = %e, "I/O error in framing codec");
+        FrameError::Io(inner) => {
+            error!(error = %inner, "I/O error in framing codec");
+            None // infrastructure error — not a dropped message
         }
+    };
+    if let Some(problem) = problem {
+        let payload = json!({
+            "event": "message_dropped",
+            "peer": cfg.peer.as_ref(),
+            "error": problem,
+        });
+        report_rejection(forwarder, &cfg.local_hostname, payload).await;
     }
 }
 
@@ -254,6 +311,7 @@ mod tests {
             max_message_size: 65536,
             sender_mode: SenderMode::Original,
             local_hostname: Arc::from("-"),
+            peer: Arc::from("<test>"),
         }
     }
 
@@ -426,10 +484,22 @@ mod tests {
         assert_eq!(snap.dropped, 1, "counter: dropped");
         assert_eq!(snap.forwarded, 0, "counter: forwarded");
 
+        // The invalid message itself must not arrive, but logfenced must send
+        // one rejection-report datagram to rsyslog.
         let mut buf = vec![0u8; 4096];
-        let recv_result =
+        let n = tokio::time::timeout(Duration::from_secs(1), receiver.recv(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let report = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(
+            report.contains("message_dropped"),
+            "expected rejection report, got: {report}"
+        );
+        // No further datagram should arrive.
+        let second =
             tokio::time::timeout(Duration::from_millis(100), receiver.recv(&mut buf)).await;
-        assert!(recv_result.is_err(), "expected timeout, got a datagram");
+        assert!(second.is_err(), "unexpected second datagram");
     }
 
     #[tokio::test]
@@ -531,11 +601,22 @@ mod tests {
         drop(client);
         session_task.await.unwrap();
 
-        let recv_result =
+        // The rejection must produce one error-report datagram to rsyslog.
+        let n = tokio::time::timeout(Duration::from_secs(1), receiver.recv(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let report = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(
+            report.contains("message_dropped"),
+            "expected rejection report after reload, got: {report}"
+        );
+        // No further datagram (the invalid message itself must not be forwarded).
+        let second =
             tokio::time::timeout(Duration::from_millis(100), receiver.recv(&mut buf)).await;
         assert!(
-            recv_result.is_err(),
-            "expected timeout after reload, got a datagram"
+            second.is_err(),
+            "unexpected second datagram after rejection report"
         );
     }
 
@@ -592,10 +673,21 @@ mod tests {
         assert_eq!(snap.dropped, 1);
         assert_eq!(snap.forwarded, 0);
 
+        // One rejection-report datagram must arrive at rsyslog; the original
+        // message must not be forwarded.
         let mut buf = vec![0u8; 4096];
-        let recv_result =
+        let n = tokio::time::timeout(Duration::from_secs(1), receiver.recv(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let report = std::str::from_utf8(&buf[..n]).unwrap();
+        assert!(
+            report.contains("message_dropped"),
+            "expected rejection report, got: {report}"
+        );
+        let second =
             tokio::time::timeout(Duration::from_millis(100), receiver.recv(&mut buf)).await;
-        assert!(recv_result.is_err(), "plain JSON should have been dropped");
+        assert!(second.is_err(), "plain JSON should have been dropped");
     }
 
     #[tokio::test]

@@ -13,7 +13,7 @@
 use std::{path::Path, sync::Arc};
 
 use thiserror::Error;
-use tokio::{io::AsyncWriteExt, net::UnixStream, sync::Mutex};
+use tokio::{io::AsyncWriteExt, net::unix::OwnedWriteHalf, net::UnixStream, sync::Mutex};
 use tracing::debug;
 
 use logfence_proto::syslog::SyslogMessage;
@@ -47,7 +47,9 @@ enum Inner {
     },
     UnixStream {
         path: String,
-        stream: Mutex<Option<UnixStream>>,
+        /// Only the write half is retained; the read half is dropped (and
+        /// `shutdown(SHUT_RD)` is issued) immediately after connecting.
+        stream: Mutex<Option<OwnedWriteHalf>>,
     },
 }
 
@@ -61,6 +63,9 @@ impl Forwarder {
         let inner = match cfg.transport {
             ForwardTransport::UnixDgram => {
                 let socket = tokio::net::UnixDatagram::unbound()?;
+                // Enforce write-only direction: logfenced never reads from the
+                // rsyslog socket.
+                socket.shutdown(std::net::Shutdown::Read)?;
                 Inner::UnixDgram {
                     socket,
                     path: cfg.socket.clone(),
@@ -91,7 +96,14 @@ impl Forwarder {
                 let frame = format!("{} {wire}", wire.len());
                 let mut guard = stream.lock().await;
                 if guard.is_none() {
-                    *guard = Some(UnixStream::connect(path).await?);
+                    // Connect, then enforce write-only direction by shutting
+                    // down the read half at the OS level before splitting.
+                    let conn = UnixStream::connect(path).await?;
+                    let std_conn = conn.into_std()?;
+                    std_conn.shutdown(std::net::Shutdown::Read)?;
+                    let conn = UnixStream::from_std(std_conn)?;
+                    let (_, write_half) = conn.into_split();
+                    *guard = Some(write_half);
                 }
                 let Some(s) = guard.as_mut() else {
                     return Err(ForwardError::Io(std::io::Error::other(

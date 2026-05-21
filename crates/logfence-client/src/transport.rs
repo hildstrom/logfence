@@ -10,7 +10,7 @@
 
 use std::path::PathBuf;
 
-use tokio::{io::AsyncWriteExt, net::UnixStream, sync::Mutex};
+use tokio::{io::AsyncWriteExt, net::unix::OwnedWriteHalf, net::UnixStream, sync::Mutex};
 
 use logfence_proto::syslog::SyslogMessage;
 
@@ -46,11 +46,15 @@ pub trait Transport: Send + Sync {
 /// Connects lazily on the first [`send`](Transport::send) call. If the
 /// connection is lost, the next `send` re-establishes it automatically.
 ///
+/// Only the write half of the underlying socket is retained.  The read half
+/// is shut down (`SHUT_RD`) immediately after connecting, enforcing write-only
+/// direction at both the type level and the OS level.
+///
 /// Thread-safe: the socket is protected by a [`tokio::sync::Mutex`].
 pub struct UnixTransport {
     path: PathBuf,
     max_size: usize,
-    stream: Mutex<Option<UnixStream>>,
+    stream: Mutex<Option<OwnedWriteHalf>>,
 }
 
 impl UnixTransport {
@@ -84,7 +88,14 @@ impl Transport for UnixTransport {
         let mut guard = self.stream.lock().await;
 
         if guard.is_none() {
-            *guard = Some(UnixStream::connect(&self.path).await?);
+            // Connect, then enforce write-only direction by shutting down the
+            // read half at the OS level before splitting.
+            let conn = UnixStream::connect(&self.path).await?;
+            let std_conn = conn.into_std()?;
+            std_conn.shutdown(std::net::Shutdown::Read)?;
+            let conn = UnixStream::from_std(std_conn)?;
+            let (_, write_half) = conn.into_split();
+            *guard = Some(write_half);
         }
 
         // `guard` is `Some` — we just set it above if it was `None`.
