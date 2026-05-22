@@ -37,6 +37,38 @@ policy cross the boundary.
 
 ---
 
+## Architecture
+
+```
+Application
+  │  logfence-client (Rust library)
+  │  MessageBuilder → JSON key-value pairs → RFC 5424 frame
+  │  Unix stream socket (octet-count framed)  ─── or ───  Unix datagram socket
+  ▼
+logfenced (daemon)
+  │  Decode → Validate (JSON + Schema) → Transform → Forward
+  │  (invalid messages dropped; rejection reported to rsyslog)
+  │  Unix datagram or stream socket  (RFC 5424 wire format)
+  ▼
+rsyslog
+```
+
+logfence is composed of four crates:
+
+| Crate | Role |
+|---|---|
+| `logfence-proto` | RFC 5424 types (`SyslogMessage`, `Facility`, `Severity`) and framing codecs (`OctetCountCodec`, `DelimiterCodec`) |
+| `logfence-client` | `MessageBuilder` fluent API, `UnixTransport` (stream), and `UnixDatagramTransport` for applications sending structured log messages |
+| `logfence-client-c` | Simple `logfence-client` C API wrapper for C applications sending structured log messages |
+| `logfence-daemon` | The `logfenced` daemon: config, validation, forwarding, metrics, signal handling |
+
+See [docs/diagrams/README.md](docs/diagrams/README.md) for architecture
+diagrams covering system context, crate dependencies, daemon module
+organisation, key types, message sequence, SIGHUP hot-reload, the validation
+pipeline flowchart, and the concurrency model.
+
+---
+
 ## Features
 
 **Validation**
@@ -98,7 +130,8 @@ dropped due to a full buffer.
 
 Datagrams are send-and-forget from the OS's perspective; when the receiver's
 socket buffer is full the kernel returns `ENOBUFS` rather than blocking. Both
-`logfence-client` and the logfenced forwarder handle this transparently:
+`logfence-client` and the logfenced forwarder handle this with a configurable
+retry schedule:
 
 | Attempt | Delay before attempt |
 |---------|----------------------|
@@ -106,45 +139,29 @@ socket buffer is full the kernel returns `ENOBUFS` rather than blocking. Both
 | 2 | 100 µs |
 | 3 | 500 µs |
 | 4 | 2 ms |
+| 5+ | 1 s each |
 
-If all four attempts fail the error is returned to the caller. Errors that are
-not buffer-full conditions (e.g. `ENOENT`, `EPERM`) are returned immediately
-without retrying.
+Errors that are not buffer-full conditions (e.g. `ENOENT`, `EPERM`) are
+returned immediately without retrying.
 
-This retry window covers transient spikes — rsyslog briefly busy draining its
-buffer — while keeping per-message latency below 3 ms in the worst case.
+**logfenced configuration** (`[rsyslog]` section):
 
----
+```toml
+# Total send attempts; 0 = unlimited (default: 4).
+dgram_max_attempts = 4
 
-## Architecture
-
-```
-Application
-  │  logfence-client (Rust library)
-  │  MessageBuilder → JSON key-value pairs → RFC 5424 frame
-  │  Unix stream socket (octet-count framed)  ─── or ───  Unix datagram socket
-  ▼
-logfenced (daemon)
-  │  Decode → Validate (JSON + Schema) → Transform → Forward
-  │  (invalid messages dropped; rejection reported to rsyslog)
-  │  Unix datagram or stream socket  (RFC 5424 wire format)
-  ▼
-rsyslog
+# What to do when attempts are exhausted: "drop" (default) or "terminate".
+# "terminate" initiates a graceful daemon shutdown.
+# Ignored when dgram_max_attempts = 0.
+dgram_exhausted = "drop"
 ```
 
-logfence is composed of four crates:
+**logfence-client** (`UnixDatagramTransport`):
 
-| Crate | Role |
-|---|---|
-| `logfence-proto` | RFC 5424 types (`SyslogMessage`, `Facility`, `Severity`) and framing codecs (`OctetCountCodec`, `DelimiterCodec`) |
-| `logfence-client` | `MessageBuilder` fluent API, `UnixTransport` (stream), and `UnixDatagramTransport` for applications sending structured log messages |
-| `logfence-client-c` | Simple `logfence-client` C API wrapper for C applications sending structured log messages |
-| `logfence-daemon` | The `logfenced` daemon: config, validation, forwarding, metrics, signal handling |
-
-See [docs/diagrams/README.md](docs/diagrams/README.md) for architecture
-diagrams covering system context, crate dependencies, daemon module
-organisation, key types, message sequence, SIGHUP hot-reload, the validation
-pipeline flowchart, and the concurrency model.
+```rust
+let transport = UnixDatagramTransport::new(path, 65_536)
+    .max_attempts(0);  // retry indefinitely
+```
 
 ---
 

@@ -337,8 +337,9 @@ mod tests {
         let cfg = RsyslogConfig {
             transport: ForwardTransport::UnixDgram,
             socket: rsyslog_sock.to_owned(),
+            ..Default::default()
         };
-        Forwarder::from_config(&cfg).unwrap()
+        Forwarder::from_config(&cfg, None).unwrap()
     }
 
     fn make_validator(mode: ValidationMode) -> Arc<Validator> {

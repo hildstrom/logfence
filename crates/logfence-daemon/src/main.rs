@@ -98,18 +98,19 @@ async fn main() -> ExitCode {
     // Shared atomic counters — incremented per message by session tasks.
     let store = MetricsStore::new();
 
-    // Build the rsyslog forwarder.
-    let forwarder = match forwarder::Forwarder::from_config(&cfg.rsyslog) {
+    let listen_transport = cfg.daemon.listen_transport;
+
+    let shutdown = CancellationToken::new();
+
+    // Build the rsyslog forwarder.  Pass the shutdown token so the forwarder
+    // can initiate graceful termination when dgram_exhausted = "terminate".
+    let forwarder = match forwarder::Forwarder::from_config(&cfg.rsyslog, Some(shutdown.clone())) {
         Ok(f) => f,
         Err(e) => {
             error!(error = %e, "failed to create rsyslog forwarder");
             return ExitCode::FAILURE;
         }
     };
-
-    let listen_transport = cfg.daemon.listen_transport;
-
-    let shutdown = CancellationToken::new();
 
     // Optional metrics stats socket.
     if cfg.metrics.enabled {

@@ -27,21 +27,14 @@ use std::{path::Path, sync::Arc, time::Duration};
 
 use thiserror::Error;
 use tokio::{io::AsyncWriteExt, net::unix::OwnedWriteHalf, net::UnixStream, sync::Mutex};
-use tracing::debug;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error};
 
 use logfence_proto::syslog::SyslogMessage;
 
-use crate::config::{ForwardTransport, RsyslogConfig};
+use crate::config::{DgramExhausted, ForwardTransport, RsyslogConfig};
 
 // ── Datagram retry ────────────────────────────────────────────────────────────
-
-// Back-off delays between successive datagram send attempts when the receiver's
-// buffer is full (ENOBUFS).  Four total attempts: one immediate + three retries.
-const DGRAM_RETRY_DELAYS: [Duration; 3] = [
-    Duration::from_micros(100),
-    Duration::from_micros(500),
-    Duration::from_millis(2),
-];
 
 fn is_buffer_full(e: &std::io::Error) -> bool {
     // WouldBlock: EAGAIN/EWOULDBLOCK — socket send buffer temporarily full.
@@ -52,27 +45,48 @@ fn is_buffer_full(e: &std::io::Error) -> bool {
     matches!(e.kind(), std::io::ErrorKind::WouldBlock) || matches!(e.raw_os_error(), Some(105 | 55))
 }
 
-// Attempt the datagram send immediately; on ENOBUFS/WouldBlock retry up to
-// three times with brief back-off so transient rsyslog buffer spikes do not
-// drop messages.  Non-retryable errors (e.g. ENOENT, EPERM) are returned
-// immediately.
+// Delay before the Nth attempt (1-indexed; no delay before attempt 1).
+// Attempts 2–4 use short exponential back-off; attempt 5+ uses 1 s to
+// provide strong backpressure when the receiver is persistently slow.
+fn dgram_attempt_delay(attempt: u32) -> Duration {
+    match attempt {
+        2 => Duration::from_micros(100),
+        3 => Duration::from_micros(500),
+        4 => Duration::from_millis(2),
+        _ => Duration::from_secs(1),
+    }
+}
+
+// Send `data` to `path`, retrying on buffer-full errors up to `max_attempts`
+// total tries.  `max_attempts = 0` means unlimited.  Non-retryable errors are
+// returned immediately without consuming any retry budget.
+//
+// Uses `try_send_to` (non-blocking) rather than `send_to` (async, waits for
+// writability) so that EAGAIN/ENOBUFS reaches `is_buffer_full` and the retry
+// schedule runs under our control instead of Tokio's internal re-queue.
 async fn send_dgram_with_retry(
     socket: &tokio::net::UnixDatagram,
     data: &[u8],
     path: &Path,
+    max_attempts: u32,
 ) -> std::io::Result<()> {
-    let mut last_err = match socket.send_to(data, path).await {
+    let mut last_err = match socket.try_send_to(data, path) {
         Ok(_) => return Ok(()),
         Err(e) if !is_buffer_full(&e) => return Err(e),
         Err(e) => e,
     };
-    for delay in DGRAM_RETRY_DELAYS {
-        tokio::time::sleep(delay).await;
-        match socket.send_to(data, path).await {
+    let mut attempt = 2u32;
+    loop {
+        if max_attempts != 0 && attempt > max_attempts {
+            break;
+        }
+        tokio::time::sleep(dgram_attempt_delay(attempt)).await;
+        match socket.try_send_to(data, path) {
             Ok(_) => return Ok(()),
             Err(e) if !is_buffer_full(&e) => return Err(e),
             Err(e) => last_err = e,
         }
+        attempt = attempt.saturating_add(1);
     }
     Err(last_err)
 }
@@ -94,7 +108,13 @@ pub enum ForwardError {
 /// The underlying connection is managed internally and reconnected on error.
 /// See the module-level documentation for cloning behaviour.
 #[derive(Clone)]
-pub struct Forwarder(Inner);
+pub struct Forwarder {
+    inner: Inner,
+    dgram_max_attempts: u32,
+    dgram_exhausted: DgramExhausted,
+    /// Cancelled when retries are exhausted with `dgram_exhausted = Terminate`.
+    shutdown: Option<CancellationToken>,
+}
 
 // Datagram state is shared across all clones (one unconnected socket).
 struct DgramConn {
@@ -138,10 +158,17 @@ impl Clone for Inner {
 impl Forwarder {
     /// Build a [`Forwarder`] from a [`RsyslogConfig`].
     ///
+    /// `shutdown` is cancelled when `dgram_exhausted = "terminate"` and all
+    /// send attempts are exhausted.  Pass `None` to use `"drop"` semantics
+    /// regardless of the config setting.
+    ///
     /// # Errors
     ///
     /// Returns [`ForwardError::Io`] if the socket cannot be created.
-    pub fn from_config(cfg: &RsyslogConfig) -> Result<Self, ForwardError> {
+    pub fn from_config(
+        cfg: &RsyslogConfig,
+        shutdown: Option<CancellationToken>,
+    ) -> Result<Self, ForwardError> {
         let inner = match cfg.transport {
             ForwardTransport::UnixDgram => {
                 let socket = tokio::net::UnixDatagram::unbound()?;
@@ -163,7 +190,12 @@ impl Forwarder {
                 stream: Mutex::new(None),
             }),
         };
-        Ok(Self(inner))
+        Ok(Self {
+            inner,
+            dgram_max_attempts: cfg.dgram_max_attempts,
+            dgram_exhausted: cfg.dgram_exhausted,
+            shutdown,
+        })
     }
 
     /// Forward a validated [`SyslogMessage`] to rsyslog.
@@ -174,10 +206,30 @@ impl Forwarder {
     /// are re-established automatically on the next call after a failure.
     pub async fn forward(&self, msg: &SyslogMessage) -> Result<(), ForwardError> {
         let wire = msg.to_string();
-        match &self.0 {
+        match &self.inner {
             Inner::UnixDgram(conn) => {
-                send_dgram_with_retry(&conn.socket, wire.as_bytes(), Path::new(&conn.path)).await?;
-                debug!(bytes = wire.len(), "forwarded via unix_dgram");
+                let result = send_dgram_with_retry(
+                    &conn.socket,
+                    wire.as_bytes(),
+                    Path::new(&conn.path),
+                    self.dgram_max_attempts,
+                )
+                .await;
+                match result {
+                    Ok(()) => debug!(bytes = wire.len(), "forwarded via unix_dgram"),
+                    Err(e) => {
+                        if is_buffer_full(&e) && self.dgram_exhausted == DgramExhausted::Terminate {
+                            error!(
+                                error = %e,
+                                "datagram retries exhausted; initiating graceful shutdown"
+                            );
+                            if let Some(token) = &self.shutdown {
+                                token.cancel();
+                            }
+                        }
+                        return Err(ForwardError::Io(e));
+                    }
+                }
             }
             Inner::UnixStream(conn) => {
                 let frame = format!("{} {wire}", wire.len());
@@ -243,6 +295,7 @@ mod tests {
         RsyslogConfig {
             transport,
             socket: socket.to_owned(),
+            ..Default::default()
         }
     }
 
@@ -294,7 +347,7 @@ mod tests {
         });
 
         let cfg = rsyslog_cfg(ForwardTransport::UnixDgram, sock_path.to_str().unwrap());
-        let forwarder = Forwarder::from_config(&cfg).unwrap();
+        let forwarder = Forwarder::from_config(&cfg, None).unwrap();
         tokio::time::timeout(Duration::from_millis(200), forwarder.forward(&sample_msg()))
             .await
             .unwrap()
@@ -308,7 +361,7 @@ mod tests {
 
         let receiver = UnixDatagram::bind(&sock_path).unwrap();
         let cfg = rsyslog_cfg(ForwardTransport::UnixDgram, sock_path.to_str().unwrap());
-        let forwarder = Forwarder::from_config(&cfg).unwrap();
+        let forwarder = Forwarder::from_config(&cfg, None).unwrap();
 
         let msg = sample_msg();
         let expected = msg.to_string();
@@ -330,7 +383,7 @@ mod tests {
         let listener = UnixListener::bind(&sock_path).unwrap();
 
         let cfg = rsyslog_cfg(ForwardTransport::UnixStream, sock_path.to_str().unwrap());
-        let forwarder = Forwarder::from_config(&cfg).unwrap();
+        let forwarder = Forwarder::from_config(&cfg, None).unwrap();
 
         let msg = sample_msg();
         let expected_wire = msg.to_string();
@@ -362,7 +415,7 @@ mod tests {
         let listener = UnixListener::bind(&sock_path).unwrap();
 
         let cfg = rsyslog_cfg(ForwardTransport::UnixStream, sock_path.to_str().unwrap());
-        let f1 = Forwarder::from_config(&cfg).unwrap();
+        let f1 = Forwarder::from_config(&cfg, None).unwrap();
         let f2 = f1.clone();
 
         let msg = sample_msg();
@@ -388,5 +441,60 @@ mod tests {
             accepted += 1;
         }
         assert_eq!(accepted, 2, "expected two independent stream connections");
+    }
+
+    /// When `dgram_exhausted = Terminate` and retries are exhausted on a full
+    /// buffer, `forward()` must return an error AND cancel the shutdown token.
+    #[tokio::test]
+    async fn dgram_exhausted_terminate_cancels_shutdown_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("rsyslog.sock");
+
+        let receiver = std::os::unix::net::UnixDatagram::bind(&sock_path).unwrap();
+        socket2::SockRef::from(&receiver)
+            .set_recv_buffer_size(4096)
+            .unwrap();
+
+        // Fill the buffer so the very first send attempt hits ENOBUFS.
+        let filler = std::os::unix::net::UnixDatagram::unbound().unwrap();
+        filler.set_nonblocking(true).unwrap();
+        let mut fill_count = 0usize;
+        loop {
+            match filler.send_to(&[0u8], &sock_path) {
+                Ok(_) => {
+                    fill_count += 1;
+                    assert!(fill_count < 100_000, "socket buffer never filled");
+                }
+                Err(ref e) if is_buffer_full(e) => break,
+                Err(ref e) => {
+                    assert!(is_buffer_full(e), "unexpected fill error: {e}");
+                    break;
+                }
+            }
+        }
+        assert!(
+            fill_count > 0,
+            "expected at least one fill message to succeed"
+        );
+
+        let shutdown = CancellationToken::new();
+        let cfg = RsyslogConfig {
+            transport: ForwardTransport::UnixDgram,
+            socket: sock_path.to_str().unwrap().to_owned(),
+            dgram_max_attempts: 1, // exhaust after the single immediate attempt
+            dgram_exhausted: DgramExhausted::Terminate,
+        };
+        let forwarder = Forwarder::from_config(&cfg, Some(shutdown.clone())).unwrap();
+
+        let result =
+            tokio::time::timeout(Duration::from_millis(500), forwarder.forward(&sample_msg()))
+                .await
+                .unwrap();
+
+        assert!(result.is_err(), "forward() must fail when buffer is full");
+        assert!(
+            shutdown.is_cancelled(),
+            "shutdown token must be cancelled on exhaustion with Terminate"
+        );
     }
 }

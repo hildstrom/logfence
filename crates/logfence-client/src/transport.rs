@@ -26,14 +26,19 @@ use crate::error::ClientError;
 
 // ── Datagram retry ────────────────────────────────────────────────────────────
 
-const DGRAM_RETRY_DELAYS: [Duration; 3] = [
-    Duration::from_micros(100),
-    Duration::from_micros(500),
-    Duration::from_millis(2),
-];
-
 fn is_buffer_full(e: &std::io::Error) -> bool {
     matches!(e.kind(), std::io::ErrorKind::WouldBlock) || matches!(e.raw_os_error(), Some(105 | 55))
+}
+
+// Delay before the Nth attempt (1-indexed; no delay before attempt 1).
+// Attempts 2–4 use short exponential back-off; attempt 5+ uses 1 s.
+fn dgram_attempt_delay(attempt: u32) -> Duration {
+    match attempt {
+        2 => Duration::from_micros(100),
+        3 => Duration::from_micros(500),
+        4 => Duration::from_millis(2),
+        _ => Duration::from_secs(1),
+    }
 }
 
 // ── Transport trait ───────────────────────────────────────────────────────────
@@ -153,6 +158,8 @@ impl Transport for UnixTransport {
 pub struct UnixDatagramTransport {
     path: PathBuf,
     max_size: usize,
+    /// Total send attempts on `ENOBUFS`.  `0` = unlimited.  Default: `4`.
+    max_attempts: u32,
     socket: Mutex<Option<UnixDatagram>>,
 }
 
@@ -161,13 +168,30 @@ impl UnixDatagramTransport {
     ///
     /// `max_size` is the maximum accepted wire message size in bytes.
     /// Use `65536` for the standard datagram limit.
+    ///
+    /// The default retry limit is 4 attempts.  Use [`max_attempts`] to change
+    /// it.
+    ///
+    /// [`max_attempts`]: UnixDatagramTransport::max_attempts
     #[must_use]
     pub fn new(path: impl Into<PathBuf>, max_size: usize) -> Self {
         Self {
             path: path.into(),
             max_size,
+            max_attempts: 4,
             socket: Mutex::new(None),
         }
+    }
+
+    /// Set the maximum number of datagram send attempts.
+    ///
+    /// `0` means unlimited — retry until the send succeeds or a non-retryable
+    /// error occurs.  Attempts 1–4 use a short exponential back-off (immediate
+    /// → 100 µs → 500 µs → 2 ms); attempt 5 and above wait 1 s each.
+    #[must_use]
+    pub fn max_attempts(mut self, n: u32) -> Self {
+        self.max_attempts = n;
+        self
     }
 }
 
@@ -203,7 +227,10 @@ impl Transport for UnixDatagramTransport {
             )));
         };
 
-        let mut last_err = match sock.send_to(wire.as_bytes(), &self.path).await {
+        // Use try_send_to (non-blocking) so buffer-full errors (EAGAIN on Linux,
+        // ENOBUFS on macOS) reach is_buffer_full and the retry schedule runs
+        // under our control instead of Tokio's internal re-queue.
+        let mut last_err = match sock.try_send_to(wire.as_bytes(), &self.path) {
             Ok(_) => return Ok(()),
             Err(e) if !is_buffer_full(&e) => {
                 *guard = None;
@@ -211,9 +238,13 @@ impl Transport for UnixDatagramTransport {
             }
             Err(e) => e,
         };
-        for delay in DGRAM_RETRY_DELAYS {
-            tokio::time::sleep(delay).await;
-            match sock.send_to(wire.as_bytes(), &self.path).await {
+        let mut attempt = 2u32;
+        loop {
+            if self.max_attempts != 0 && attempt > self.max_attempts {
+                break;
+            }
+            tokio::time::sleep(dgram_attempt_delay(attempt)).await;
+            match sock.try_send_to(wire.as_bytes(), &self.path) {
                 Ok(_) => return Ok(()),
                 Err(e) if !is_buffer_full(&e) => {
                     *guard = None;
@@ -221,6 +252,7 @@ impl Transport for UnixDatagramTransport {
                 }
                 Err(e) => last_err = e,
             }
+            attempt = attempt.saturating_add(1);
         }
         *guard = None;
         Err(ClientError::Io(last_err))

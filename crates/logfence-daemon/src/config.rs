@@ -181,11 +181,37 @@ pub struct RsyslogConfig {
     /// Socket path for Unix transports.
     #[serde(default = "RsyslogConfig::default_socket")]
     pub socket: String,
+
+    /// Maximum number of datagram send attempts when the receiver's buffer is
+    /// full (`ENOBUFS`).  `0` means unlimited — retry until the send succeeds
+    /// or a non-retryable error occurs.  Default: `4`.
+    ///
+    /// Attempts 1–4 use a short exponential back-off (immediate → 100 µs →
+    /// 500 µs → 2 ms).  Attempt 5 and above wait 1 s between each try,
+    /// providing stronger backpressure when the receiver is persistently slow.
+    ///
+    /// Only relevant when `transport = "unix_dgram"`.
+    #[serde(default = "RsyslogConfig::default_dgram_max_attempts")]
+    pub dgram_max_attempts: u32,
+
+    /// What to do when all datagram send attempts are exhausted.
+    ///
+    /// `"drop"` (default) — drop the message and report an error.
+    /// `"terminate"` — initiate a graceful daemon shutdown.
+    ///
+    /// Ignored when `dgram_max_attempts = 0` (unlimited retries never exhaust).
+    /// Only relevant when `transport = "unix_dgram"`.
+    #[serde(default)]
+    pub dgram_exhausted: DgramExhausted,
 }
 
 impl RsyslogConfig {
     fn default_socket() -> String {
         "/run/syslog".to_owned()
+    }
+
+    const fn default_dgram_max_attempts() -> u32 {
+        4
     }
 }
 
@@ -194,6 +220,8 @@ impl Default for RsyslogConfig {
         Self {
             transport: ForwardTransport::default(),
             socket: Self::default_socket(),
+            dgram_max_attempts: Self::default_dgram_max_attempts(),
+            dgram_exhausted: DgramExhausted::default(),
         }
     }
 }
@@ -207,6 +235,17 @@ pub enum ForwardTransport {
     UnixDgram,
     /// Unix stream socket with octet-count framing.
     UnixStream,
+}
+
+/// What to do when datagram send attempts are exhausted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DgramExhausted {
+    /// Drop the message and return an error to the caller (default).
+    #[default]
+    Drop,
+    /// Cancel the daemon shutdown token to initiate graceful termination.
+    Terminate,
 }
 
 /// Message validation settings.
@@ -666,5 +705,38 @@ output_cee = "optional"
         );
         let cfg = load(f.path()).unwrap();
         assert!(cfg.metrics.enabled);
+    }
+
+    #[test]
+    fn dgram_max_attempts_defaults_to_4() {
+        let f = write_toml("[daemon]\nlisten_socket = \"/tmp/t.sock\"\n\n[rsyslog]\n");
+        let cfg = load(f.path()).unwrap();
+        assert_eq!(cfg.rsyslog.dgram_max_attempts, 4);
+    }
+
+    #[test]
+    fn dgram_max_attempts_parses() {
+        let f = write_toml(
+            "[daemon]\nlisten_socket = \"/tmp/t.sock\"\n\n[rsyslog]\ndgram_max_attempts = 0\n",
+        );
+        let cfg = load(f.path()).unwrap();
+        assert_eq!(cfg.rsyslog.dgram_max_attempts, 0);
+    }
+
+    #[test]
+    fn dgram_exhausted_defaults_to_drop() {
+        let f = write_toml("[daemon]\nlisten_socket = \"/tmp/t.sock\"\n\n[rsyslog]\n");
+        let cfg = load(f.path()).unwrap();
+        assert_eq!(cfg.rsyslog.dgram_exhausted, DgramExhausted::Drop);
+    }
+
+    #[test]
+    fn dgram_exhausted_terminate_parses() {
+        let f = write_toml(
+            "[daemon]\nlisten_socket = \"/tmp/t.sock\"\n\
+             \n[rsyslog]\ndgram_exhausted = \"terminate\"\n",
+        );
+        let cfg = load(f.path()).unwrap();
+        assert_eq!(cfg.rsyslog.dgram_exhausted, DgramExhausted::Terminate);
     }
 }

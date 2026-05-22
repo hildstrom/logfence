@@ -348,10 +348,14 @@ mod tests {
     }
 
     fn make_forwarder(rsyslog_sock: &str) -> Forwarder {
-        Forwarder::from_config(&RsyslogConfig {
-            transport: ForwardTransport::UnixDgram,
-            socket: rsyslog_sock.to_owned(),
-        })
+        Forwarder::from_config(
+            &RsyslogConfig {
+                transport: ForwardTransport::UnixDgram,
+                socket: rsyslog_sock.to_owned(),
+                ..Default::default()
+            },
+            None,
+        )
         .unwrap()
     }
 

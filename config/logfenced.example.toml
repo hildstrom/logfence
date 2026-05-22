@@ -38,6 +38,26 @@ transport = "unix_dgram"
 # macOS default: /var/run/syslog
 socket = "/run/syslog"
 
+# Datagram reliability settings — only relevant when transport = "unix_dgram".
+#
+# Maximum number of send attempts when the receiver's buffer is full (ENOBUFS).
+# 0 = unlimited (retry until the send succeeds or a non-retryable error occurs).
+# Default: 4
+#
+# Attempt 1 is immediate.  Attempts 2–4 use short exponential back-off
+# (100 µs → 500 µs → 2 ms).  Attempt 5 and above wait 1 s each, providing
+# strong backpressure when rsyslog is persistently slow.
+# dgram_max_attempts = 4
+
+# What to do when all dgram_max_attempts attempts are exhausted.
+# Ignored when dgram_max_attempts = 0 (unlimited retries never exhaust).
+#
+# "drop"      — drop the message and log an error (default).
+# "terminate" — initiate a graceful daemon shutdown.  Use this when losing
+#               log messages is unacceptable and operator intervention is
+#               preferable to silent data loss.
+# dgram_exhausted = "drop"
+
 [validation]
 # Schema enforcement mode.
 # "strict" — message must match at least one schema; non-matching messages are dropped.
