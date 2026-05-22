@@ -158,50 +158,59 @@ fn spawn_dgram_drainer(
     })
 }
 
-/// Bind a Unix stream listener at `path` and spawn a thread that sums received
-/// bytes into `forwarded`.  Reconnects if the connection is dropped.  Stops
-/// when `stop` is set.
+/// Bind a Unix stream listener at `path` and spawn a single polling thread that
+/// accepts multiple connections and reads all of them in one loop, summing
+/// received bytes into `forwarded`.
+///
+/// A single thread with non-blocking reads avoids the thundering-herd problem
+/// of spawning one thread per connection with a 50 ms read timeout: with up to
+/// 256 worker connections from the daemon, per-connection threads would all
+/// wake simultaneously on their timeouts, adding ~1 ms overhead per iteration.
 fn spawn_stream_drainer(
     path: &std::path::Path,
     forwarded: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
+    use std::io::Read;
     let listener =
         std::os::unix::net::UnixListener::bind(path).expect("bind mock rsyslog stream listener");
     listener.set_nonblocking(true).expect("set nonblocking");
     thread::spawn(move || {
-        use std::io::Read;
+        let mut conns: Vec<std::os::unix::net::UnixStream> = Vec::new();
         let mut buf = vec![0u8; 65_536];
-        'outer: while !stop.load(Ordering::Relaxed) {
-            let mut stream = loop {
-                if stop.load(Ordering::Relaxed) {
-                    break 'outer;
-                }
-                match listener.accept() {
-                    Ok((s, _)) => break s,
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(_) => break 'outer,
-                }
-            };
-            stream
-                .set_read_timeout(Some(Duration::from_millis(50)))
-                .expect("set read timeout");
+        while !stop.load(Ordering::Relaxed) {
             loop {
-                if stop.load(Ordering::Relaxed) {
-                    break 'outer;
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(true).expect("set nonblocking");
+                        conns.push(stream);
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(_) => return,
                 }
-                match stream.read(&mut buf) {
-                    Ok(0) => break,
+            }
+            let mut i = 0;
+            let mut had_data = false;
+            while i < conns.len() {
+                match conns[i].read(&mut buf) {
+                    Ok(0) => {
+                        conns.swap_remove(i);
+                    }
                     Ok(n) => {
                         forwarded.fetch_add(n as u64, Ordering::Relaxed);
+                        had_data = true;
+                        i += 1;
                     }
-                    Err(ref e)
-                        if e.kind() == io::ErrorKind::WouldBlock
-                            || e.kind() == io::ErrorKind::TimedOut => {}
-                    Err(_) => break,
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        i += 1;
+                    }
+                    Err(_) => {
+                        conns.swap_remove(i);
+                    }
                 }
+            }
+            if !had_data {
+                thread::sleep(Duration::from_micros(50));
             }
         }
     })

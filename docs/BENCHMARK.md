@@ -63,9 +63,9 @@ Stream input, stream output to mock rsyslog (`[rsyslog] transport =
 
 | Benchmark | Connections | Msgs/conn | Median thrpt | 95% CI |
 |---|---|---|---|---|
-| `load_1x1000` | 1 | 1 000 | 836.36 Kelem/s | 831.8 – 841.6 |
-| `load_4x250` | 4 | 250 | 512.38 Kelem/s | 511.0 – 513.6 |
-| `load_100x10` | 100 | 10 | 391.68 Kelem/s | 389.8 – 393.6 |
+| `load_1x1000` | 1 | 1 000 | 933.37 Kelem/s | 931.3 – 935.4 |
+| `load_4x250` | 4 | 250 | 1097.8 Kelem/s | 1096.1 – 1099.4 |
+| `load_100x10` | 100 | 10 | 889.17 Kelem/s | 884.4 – 893.9 |
 
 ## no_schema_dgram_dgram
 
@@ -85,9 +85,9 @@ Datagram input, stream output.  `[validation] mode = "off"`.
 
 | Benchmark | Senders | Msgs/sender | Median thrpt | 95% CI |
 |---|---|---|---|---|
-| `load_1x1000` | 1 | 1 000 | 342.27 Kelem/s | 339.9 – 344.6 |
-| `load_4x250` | 4 | 250 | 348.35 Kelem/s | 346.6 – 350.1 |
-| `load_100x10` | 100 | 10 | 358.67 Kelem/s | 356.8 – 360.5 |
+| `load_1x1000` | 1 | 1 000 | 322.06 Kelem/s | 320.4 – 323.7 |
+| `load_4x250` | 4 | 250 | 319.91 Kelem/s | 318.0 – 321.9 |
+| `load_100x10` | 100 | 10 | 304.66 Kelem/s | 302.7 – 306.7 |
 
 ## with_schema_stream_dgram
 
@@ -119,27 +119,22 @@ the Tokio scheduler overlaps validation work across concurrent sessions.
 
 | Benchmark | stream_dgram | stream_stream | Ratio |
 |---|---|---|---|
-| `load_1x1000` | 811.70 Kelem/s | 836.36 Kelem/s | 1.0× (stream_stream faster) |
-| `load_4x250` | 957.81 Kelem/s | 512.38 Kelem/s | 1.9× |
-| `load_100x10` | 757.89 Kelem/s | 391.68 Kelem/s | 1.9× |
+| `load_1x1000` | 811.70 Kelem/s | 933.37 Kelem/s | 1.15× (stream_stream faster) |
+| `load_4x250` | 957.81 Kelem/s | 1097.8 Kelem/s | 1.15× (stream_stream faster) |
+| `load_100x10` | 757.89 Kelem/s | 889.17 Kelem/s | 1.17× (stream_stream faster) |
 
-On a single connection, stream output is slightly faster than datagram output
-(836 vs 812 Kelem/s).  A persistent stream connection requires no per-message
-socket address resolution, and `write_all` on a connected socket is marginally
-cheaper than `send_to` on an unconnected one.
+Stream output is ~15% faster than datagram output at every connection count.
+Each session task holds its own independent persistent stream connection, so
+output writes proceed in parallel with no mutex contention between sessions.
+A persistent `write_all` on a connected socket is also cheaper per message
+than `send_to` on an unconnected socket, which must resolve the destination
+address on every call.
 
-With 4 or 100 concurrent input connections, stream output falls to roughly half
-the datagram throughput.  The cause is the `Mutex<Option<OwnedWriteHalf>>` in
-the stream forwarder: all session tasks share a single write half, so output
-writes are fully serialised regardless of how many input connections are
-processing messages concurrently.  Datagram output has no such lock; each
-`send_to()` goes directly to the kernel without mutual exclusion.
-
-Use `unix_stream` output when the downstream rsyslog instance is configured for
-`imtcp` or `imuxsock` (stream-mode) or when a single persistent connection is
-preferred.  Use `unix_dgram` output (the default) for maximum throughput when
-logfenced is acting as a drop-in filter in front of a standard rsyslog
-datagram socket.
+Use `unix_dgram` output (the default) when rsyslog is configured for
+`imuxsock` datagram input or when a stateless, connectionless output is
+preferred.  Use `unix_stream` output when rsyslog is configured for
+`imtcp` or stream-mode `imuxsock`; it delivers higher throughput and
+maintains one persistent connection per logfenced session task.
 
 ## Input transport comparison (datagram output, no schema)
 
@@ -174,20 +169,23 @@ stream group peaks at 958 Kelem/s at 4 connections.
 
 | Benchmark | dgram_dgram | dgram_stream | Overhead |
 |---|---|---|---|
-| `load_1x1000` | 375.04 Kelem/s | 342.27 Kelem/s | 1.10× |
-| `load_4x250` | 379.91 Kelem/s | 348.35 Kelem/s | 1.09× |
-| `load_100x10` | 373.99 Kelem/s | 358.67 Kelem/s | 1.04× |
+| `load_1x1000` | 375.04 Kelem/s | 322.06 Kelem/s | 1.16× |
+| `load_4x250` | 379.91 Kelem/s | 319.91 Kelem/s | 1.19× |
+| `load_100x10` | 373.99 Kelem/s | 304.66 Kelem/s | 1.23× |
 
-On the datagram input path the output transport has minimal impact (~4–10%
-overhead for stream vs datagram output).  The bottleneck remains the serialised
-datagram receive loop, not the output write path.  The framing overhead of
-RFC 6587 octet-count formatting and the stream write mutex are small compared
-to the per-datagram `try_recv_from` syscall cost.
+Stream output adds ~16–23% overhead on the datagram input path.  The datagram
+receive loop remains the dominant bottleneck, but the per-clone stream
+connection design means each of the 256 worker tasks establishes its own
+persistent connection to rsyslog.  Managing 256 simultaneous connections on
+the receiver side adds overhead that is absent on the datagram path, where
+delivery is stateless and connectionless.
 
-The slight improvement at 100 senders reflects the benchmark structure: with
-100 concurrent async senders in the benchmark harness the sends are more
-interleaved, keeping the daemon's receive buffer fuller and reducing idle
-cycles in the drain loop.
+This overhead is specific to the benchmark's fixed pool of 256 workers; in
+production the number of active connections equals the number of concurrent
+worker tasks actually processing messages, which is typically much lower.
+A real rsyslog instance also handles persistent connections with efficient
+kernel-level I/O multiplexing, so production overhead would be lower than
+what the single-threaded benchmark drainer measures.
 
 ## Transport selection summary
 

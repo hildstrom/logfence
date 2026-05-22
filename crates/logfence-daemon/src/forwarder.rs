@@ -9,6 +9,19 @@
 //!   rsyslog `imuxsock` on Linux/macOS).
 //! - `unix_stream` — sends each message with RFC 6587 octet-count framing
 //!   over a Unix stream socket.
+//!
+//! ## Cloning behaviour
+//!
+//! `Forwarder` is cheaply cloneable and safe to pass to Tokio tasks.
+//!
+//! For `unix_dgram` output, all clones share a single unconnected socket via
+//! `Arc`; no per-message connection setup is needed and `send_to` is lock-free.
+//!
+//! For `unix_stream` output, each clone holds an **independent** connection
+//! slot (`Mutex<None>` on construction, lazily connected on first use).
+//! Session tasks and worker tasks that each hold their own cloned `Forwarder`
+//! therefore maintain separate persistent connections to rsyslog, allowing
+//! writes to proceed in parallel without contending on a shared mutex.
 
 use std::{path::Path, sync::Arc};
 
@@ -35,22 +48,47 @@ pub enum ForwardError {
 /// Sends validated syslog messages to rsyslog.
 ///
 /// The underlying connection is managed internally and reconnected on error.
-/// `Forwarder` is cheaply cloneable (`Arc`-backed) and safe to share across
-/// Tokio tasks.
+/// See the module-level documentation for cloning behaviour.
 #[derive(Clone)]
-pub struct Forwarder(Arc<Inner>);
+pub struct Forwarder(Inner);
+
+// Datagram state is shared across all clones (one unconnected socket).
+struct DgramConn {
+    socket: tokio::net::UnixDatagram,
+    path: String,
+}
+
+// Stream state is NOT shared: each clone of `Forwarder` holds its own
+// independent connection slot.
+struct StreamConn {
+    path: String,
+    /// Only the write half is retained after connecting.  The read half is
+    /// dropped (and `shutdown(SHUT_RD)` issued) immediately after the OS
+    /// connection is established.
+    stream: Mutex<Option<OwnedWriteHalf>>,
+}
+
+impl Clone for StreamConn {
+    fn clone(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            stream: Mutex::new(None), // fresh, independent connection slot
+        }
+    }
+}
 
 enum Inner {
-    UnixDgram {
-        socket: tokio::net::UnixDatagram,
-        path: String,
-    },
-    UnixStream {
-        path: String,
-        /// Only the write half is retained; the read half is dropped (and
-        /// `shutdown(SHUT_RD)` is issued) immediately after connecting.
-        stream: Mutex<Option<OwnedWriteHalf>>,
-    },
+    UnixDgram(Arc<DgramConn>),
+    UnixStream(StreamConn),
+}
+
+impl Clone for Inner {
+    fn clone(&self) -> Self {
+        match self {
+            Inner::UnixDgram(arc) => Inner::UnixDgram(Arc::clone(arc)),
+            Inner::UnixStream(conn) => Inner::UnixStream(conn.clone()),
+        }
+    }
 }
 
 impl Forwarder {
@@ -66,17 +104,17 @@ impl Forwarder {
                 // Enforce write-only direction: logfenced never reads from the
                 // rsyslog socket.
                 socket.shutdown(std::net::Shutdown::Read)?;
-                Inner::UnixDgram {
+                Inner::UnixDgram(Arc::new(DgramConn {
                     socket,
                     path: cfg.socket.clone(),
-                }
+                }))
             }
-            ForwardTransport::UnixStream => Inner::UnixStream {
+            ForwardTransport::UnixStream => Inner::UnixStream(StreamConn {
                 path: cfg.socket.clone(),
                 stream: Mutex::new(None),
-            },
+            }),
         };
-        Ok(Self(Arc::new(inner)))
+        Ok(Self(inner))
     }
 
     /// Forward a validated [`SyslogMessage`] to rsyslog.
@@ -87,22 +125,24 @@ impl Forwarder {
     /// are re-established automatically on the next call after a failure.
     pub async fn forward(&self, msg: &SyslogMessage) -> Result<(), ForwardError> {
         let wire = msg.to_string();
-        match self.0.as_ref() {
-            Inner::UnixDgram { socket, path } => {
-                socket.send_to(wire.as_bytes(), Path::new(path)).await?;
+        match &self.0 {
+            Inner::UnixDgram(conn) => {
+                conn.socket
+                    .send_to(wire.as_bytes(), Path::new(&conn.path))
+                    .await?;
                 debug!(bytes = wire.len(), "forwarded via unix_dgram");
             }
-            Inner::UnixStream { path, stream } => {
+            Inner::UnixStream(conn) => {
                 let frame = format!("{} {wire}", wire.len());
-                let mut guard = stream.lock().await;
+                let mut guard = conn.stream.lock().await;
                 if guard.is_none() {
                     // Connect, then enforce write-only direction by shutting
                     // down the read half at the OS level before splitting.
-                    let conn = UnixStream::connect(path).await?;
-                    let std_conn = conn.into_std()?;
-                    std_conn.shutdown(std::net::Shutdown::Read)?;
-                    let conn = UnixStream::from_std(std_conn)?;
-                    let (_, write_half) = conn.into_split();
+                    let raw = UnixStream::connect(&conn.path).await?;
+                    let std_raw = raw.into_std()?;
+                    std_raw.shutdown(std::net::Shutdown::Read)?;
+                    let raw = UnixStream::from_std(std_raw)?;
+                    let (_, write_half) = raw.into_split();
                     *guard = Some(write_half);
                 }
                 let Some(s) = guard.as_mut() else {
@@ -211,5 +251,40 @@ mod tests {
         assert_eq!(body, expected_wire);
 
         send_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn clone_creates_independent_stream_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("rsyslog.sock");
+        let listener = UnixListener::bind(&sock_path).unwrap();
+
+        let cfg = rsyslog_cfg(ForwardTransport::UnixStream, sock_path.to_str().unwrap());
+        let f1 = Forwarder::from_config(&cfg).unwrap();
+        let f2 = f1.clone();
+
+        let msg = sample_msg();
+
+        // Forward from both clones concurrently.
+        let m1 = msg.clone();
+        let m2 = msg.clone();
+        let (r1, r2) = tokio::join!(
+            tokio::spawn(async move { f1.forward(&m1).await.unwrap() }),
+            tokio::spawn(async move { f2.forward(&m2).await.unwrap() }),
+        );
+        r1.unwrap();
+        r2.unwrap();
+
+        // Both clones must have established independent connections: the listener
+        // should have accepted exactly two connections.
+        let mut accepted = 0usize;
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(1), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            accepted += 1;
+        }
+        assert_eq!(accepted, 2, "expected two independent stream connections");
     }
 }

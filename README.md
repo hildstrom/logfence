@@ -163,13 +163,13 @@ across concurrent sessions.
 
 | Benchmark | Median thrpt |
 |---|---|
-| 1 connection × 1 000 msgs | 836 Kelem/s |
-| 4 connections × 250 msgs | 512 Kelem/s |
-| 100 connections × 100 msgs | 392 Kelem/s |
+| 1 connection × 1 000 msgs | 933 Kelem/s |
+| 4 connections × 250 msgs | 1098 Kelem/s |
+| 100 connections × 10 msgs | 889 Kelem/s |
 
-Stream output matches stream-datagram throughput on a single connection but
-degrades to roughly half at 4+ connections. The stream forwarder serialises all
-output writes through a mutex; datagram output has no such lock.
+Stream output is ~15% faster than datagram output at every connection count.
+Each session task holds its own independent persistent connection, so writes
+proceed in parallel with no mutex contention between sessions.
 
 **Datagram input, datagram output** (`no_schema_dgram_dgram`, no schema):
 
@@ -183,16 +183,16 @@ output writes through a mutex; datagram output has no such lock.
 
 | Benchmark | Median thrpt |
 |---|---|
-| 1 sender × 1 000 msgs | 342 Kelem/s |
-| 4 senders × 250 msgs | 348 Kelem/s |
-| 100 senders × 10 msgs | 359 Kelem/s |
+| 1 sender × 1 000 msgs | 322 Kelem/s |
+| 4 senders × 250 msgs | 320 Kelem/s |
+| 100 senders × 10 msgs | 305 Kelem/s |
 
 Datagram input throughput is roughly 2–2.5× lower than stream input and nearly
 flat across sender counts. The receive loop requires one `try_recv_from` syscall
 per datagram — that boundary is inherent to the protocol. A fixed worker pool
 processes validated messages in parallel after the drain loop. The output
-transport adds at most 10% overhead on the datagram path because the receive
-loop is the bottleneck regardless.
+transport adds ~16–23% overhead on the datagram path; the receive loop remains
+the bottleneck regardless.
 
 Full benchmark details and methodology: [docs/BENCHMARK.md](docs/BENCHMARK.md)
 
