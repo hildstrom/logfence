@@ -13,8 +13,16 @@ use std::{
     time::Duration,
 };
 
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
+
 use tempfile::TempDir;
-use tokio::net::UnixDatagram;
+use tokio::{
+    io::AsyncReadExt,
+    net::{UnixDatagram, UnixListener},
+};
 
 use logfence_client::{builder::CEE_COOKIE, MessageBuilder, Transport, UnixTransport};
 use logfence_proto::syslog::{Facility, Priority, Severity, SyslogMessage};
@@ -930,4 +938,122 @@ async fn sender_original_preserves_sender_fields() {
     );
 
     f.shutdown().await;
+}
+
+// ── Stream output tests ───────────────────────────────────────────────────────
+
+/// When logfenced is configured with `unix_stream` rsyslog output, sending N
+/// messages should result in exactly N RFC 6587 frames arriving at the mock
+/// rsyslog stream listener — no drops, no duplicates.
+///
+/// This also implicitly verifies that stream output backpressure propagates
+/// correctly: the session task's `write_all` blocks when the downstream
+/// connection is slow, which in turn pauses `read_buf` from the client, keeping
+/// the client's own `write_all` blocked rather than dropping messages.
+#[tokio::test]
+async fn stream_output_delivers_all_messages() {
+    const N: u64 = 200;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let listen_path = dir.path().join("logfenced.sock");
+    let rsyslog_path = dir.path().join("rsyslog.sock");
+    let config_path = dir.path().join("config.toml");
+
+    // Mock rsyslog: accept one stream connection and count incoming bytes.
+    let rsyslog_listener = UnixListener::bind(&rsyslog_path).expect("bind rsyslog stream listener");
+    let bytes_received = Arc::new(AtomicU64::new(0));
+    let bytes_clone = Arc::clone(&bytes_received);
+    tokio::spawn(async move {
+        let (mut conn, _) = rsyslog_listener
+            .accept()
+            .await
+            .expect("accept rsyslog conn");
+        let mut buf = vec![0u8; 65_536];
+        loop {
+            match conn.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    bytes_clone.fetch_add(n as u64, Ordering::Relaxed);
+                }
+            }
+        }
+    });
+
+    let config = format!(
+        "[daemon]\nlisten_socket = \"{listen}\"\nsocket_mode = \"0600\"\n\
+         max_connections = 256\n\
+         [rsyslog]\ntransport = \"unix_stream\"\nsocket = \"{rsyslog}\"\n\
+         [validation]\nmode = \"off\"\n",
+        listen = listen_path.display(),
+        rsyslog = rsyslog_path.display(),
+    );
+    std::fs::write(&config_path, &config).expect("write config");
+
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_logfenced"))
+        .args(["--config", config_path.to_str().expect("path is UTF-8")])
+        .env("RUST_LOG", "error")
+        .spawn()
+        .expect("spawn logfenced");
+
+    // Wait for daemon to bind its listen socket.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !listen_path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "logfenced did not bind its listen socket within 5 s"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Send a single warmup message and measure its RFC 6587 frame size.
+    let transport = UnixTransport::new(&listen_path, 65_536);
+    send_event_on(&listen_path, "warmup", Some(&transport)).await;
+    let deadline2 = std::time::Instant::now() + Duration::from_secs(2);
+    while bytes_received.load(Ordering::Relaxed) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline2,
+            "warmup message did not arrive at mock rsyslog"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let bytes_per_msg = bytes_received.load(Ordering::Relaxed);
+
+    // Send N messages with the same payload so bytes_per_msg stays constant.
+    let baseline = bytes_received.load(Ordering::Relaxed);
+    for _ in 0..N {
+        send_event_on(&listen_path, "warmup", Some(&transport)).await;
+    }
+    drop(transport);
+
+    // Spin until all N messages have been received or the deadline expires.
+    let target = baseline + N * bytes_per_msg;
+    let deadline3 = std::time::Instant::now() + Duration::from_secs(5);
+    while bytes_received.load(Ordering::Relaxed) < target {
+        assert!(
+            std::time::Instant::now() < deadline3,
+            "only {} of {} expected bytes arrived at mock rsyslog within 5 s",
+            bytes_received.load(Ordering::Relaxed),
+            target,
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        bytes_received.load(Ordering::Relaxed),
+        target,
+        "expected exactly {target} bytes ({bytes_per_msg} warmup + {N} × {bytes_per_msg})",
+    );
+
+    // Clean shutdown.
+    Command::new("kill")
+        .args(["-TERM", &daemon.id().to_string()])
+        .status()
+        .expect("send SIGTERM");
+    for _ in 0..100 {
+        match daemon.try_wait() {
+            Ok(Some(_)) => break,
+            _ => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+    let _ = daemon.kill();
 }

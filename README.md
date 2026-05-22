@@ -81,6 +81,41 @@ policy cross the boundary.
 
 ---
 
+## Backpressure and Reliability
+
+logfence is designed to avoid dropping messages under load. The strategy differs
+by transport type.
+
+**Stream transports (client → logfenced and logfenced → rsyslog)**
+
+Stream writes use `write_all`, which suspends the writing task when the
+receiver's socket buffer is full. Backpressure propagates end-to-end
+automatically: a slow rsyslog slows logfenced's forwarding, which eventually
+slows the session tasks handling incoming client connections. No message is
+dropped due to a full buffer.
+
+**Datagram transports (client → logfenced and logfenced → rsyslog)**
+
+Datagrams are send-and-forget from the OS's perspective; when the receiver's
+socket buffer is full the kernel returns `ENOBUFS` rather than blocking. Both
+`logfence-client` and the logfenced forwarder handle this transparently:
+
+| Attempt | Delay before attempt |
+|---------|----------------------|
+| 1 (immediate) | — |
+| 2 | 100 µs |
+| 3 | 500 µs |
+| 4 | 2 ms |
+
+If all four attempts fail the error is returned to the caller. Errors that are
+not buffer-full conditions (e.g. `ENOENT`, `EPERM`) are returned immediately
+without retrying.
+
+This retry window covers transient spikes — rsyslog briefly busy draining its
+buffer — while keeping per-message latency below 3 ms in the worst case.
+
+---
+
 ## Architecture
 
 ```

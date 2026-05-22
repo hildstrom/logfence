@@ -14,7 +14,7 @@
 //!   configured with `listen_transport = "unix_dgram"`. No framing is added;
 //!   the datagram boundary is the message boundary.
 
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use tokio::{
     io::AsyncWriteExt, net::unix::OwnedWriteHalf, net::UnixDatagram, net::UnixStream, sync::Mutex,
@@ -23,6 +23,18 @@ use tokio::{
 use logfence_proto::syslog::SyslogMessage;
 
 use crate::error::ClientError;
+
+// ── Datagram retry ────────────────────────────────────────────────────────────
+
+const DGRAM_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_micros(100),
+    Duration::from_micros(500),
+    Duration::from_millis(2),
+];
+
+fn is_buffer_full(e: &std::io::Error) -> bool {
+    matches!(e.kind(), std::io::ErrorKind::WouldBlock) || matches!(e.raw_os_error(), Some(105 | 55))
+}
 
 // ── Transport trait ───────────────────────────────────────────────────────────
 
@@ -185,13 +197,27 @@ impl Transport for UnixDatagramTransport {
             )));
         };
 
-        if let Err(e) = sock.send_to(wire.as_bytes(), &self.path).await {
-            // Drop the socket; next call will recreate it.
-            *guard = None;
-            return Err(ClientError::Io(e));
+        let mut last_err = match sock.send_to(wire.as_bytes(), &self.path).await {
+            Ok(_) => return Ok(()),
+            Err(e) if !is_buffer_full(&e) => {
+                *guard = None;
+                return Err(ClientError::Io(e));
+            }
+            Err(e) => e,
+        };
+        for delay in DGRAM_RETRY_DELAYS {
+            tokio::time::sleep(delay).await;
+            match sock.send_to(wire.as_bytes(), &self.path).await {
+                Ok(_) => return Ok(()),
+                Err(e) if !is_buffer_full(&e) => {
+                    *guard = None;
+                    return Err(ClientError::Io(e));
+                }
+                Err(e) => last_err = e,
+            }
         }
-
-        Ok(())
+        *guard = None;
+        Err(ClientError::Io(last_err))
     }
 }
 
@@ -321,5 +347,51 @@ mod tests {
 
         let err = transport.send(&sample_msg()).await.unwrap_err();
         assert!(matches!(err, ClientError::MessageTooLarge { .. }));
+    }
+
+    /// Fill the receiver's buffer with the minimum `SO_RCVBUF`, spawn a drain
+    /// thread that waits 200 µs (past the 100 µs first-retry delay), and verify
+    /// that `send()` recovers via the retry loop.
+    #[tokio::test]
+    async fn unix_datagram_retries_on_buffer_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("dgram_retry.sock");
+
+        let receiver = std::os::unix::net::UnixDatagram::bind(&sock_path).unwrap();
+        socket2::SockRef::from(&receiver)
+            .set_recv_buffer_size(4096)
+            .unwrap();
+
+        let filler = std::os::unix::net::UnixDatagram::unbound().unwrap();
+        filler.set_nonblocking(true).unwrap();
+        let mut fill_count = 0usize;
+        loop {
+            match filler.send_to(&[0u8], &sock_path) {
+                Ok(_) => {
+                    fill_count += 1;
+                    assert!(fill_count < 100_000, "socket buffer never filled");
+                }
+                Err(ref e) if super::is_buffer_full(e) => break,
+                Err(ref e) => {
+                    assert!(super::is_buffer_full(e), "unexpected fill error: {e}");
+                    break;
+                }
+            }
+        }
+        assert!(fill_count > 0);
+
+        let drainer = receiver.try_clone().unwrap();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_micros(200));
+            let mut buf = vec![0u8; 65_536];
+            drainer.set_nonblocking(true).unwrap();
+            while drainer.recv(&mut buf).is_ok() {}
+        });
+
+        let transport = UnixDatagramTransport::new(&sock_path, 65_536);
+        tokio::time::timeout(Duration::from_millis(200), transport.send(&sample_msg()))
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

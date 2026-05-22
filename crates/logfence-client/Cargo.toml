@@ -12,9 +12,10 @@ logfence-proto = { path = "../logfence-proto" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
+socket2  = "0.6.3"
 tempfile = "3.27.0"
 tokio = { workspace = true, features = ["time"] }
 

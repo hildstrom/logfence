@@ -23,7 +23,7 @@
 //! therefore maintain separate persistent connections to rsyslog, allowing
 //! writes to proceed in parallel without contending on a shared mutex.
 
-use std::{path::Path, sync::Arc};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use thiserror::Error;
 use tokio::{io::AsyncWriteExt, net::unix::OwnedWriteHalf, net::UnixStream, sync::Mutex};
@@ -32,6 +32,50 @@ use tracing::debug;
 use logfence_proto::syslog::SyslogMessage;
 
 use crate::config::{ForwardTransport, RsyslogConfig};
+
+// ── Datagram retry ────────────────────────────────────────────────────────────
+
+// Back-off delays between successive datagram send attempts when the receiver's
+// buffer is full (ENOBUFS).  Four total attempts: one immediate + three retries.
+const DGRAM_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_micros(100),
+    Duration::from_micros(500),
+    Duration::from_millis(2),
+];
+
+fn is_buffer_full(e: &std::io::Error) -> bool {
+    // WouldBlock: EAGAIN/EWOULDBLOCK — socket send buffer temporarily full.
+    // Raw 105: ENOBUFS on Linux (all asm-generic architectures).
+    // Raw 55: ENOBUFS on macOS/BSD.
+    // ErrorKind::NoBufferSpace is not yet stable in the current toolchain;
+    // check the raw OS error number directly.
+    matches!(e.kind(), std::io::ErrorKind::WouldBlock) || matches!(e.raw_os_error(), Some(105 | 55))
+}
+
+// Attempt the datagram send immediately; on ENOBUFS/WouldBlock retry up to
+// three times with brief back-off so transient rsyslog buffer spikes do not
+// drop messages.  Non-retryable errors (e.g. ENOENT, EPERM) are returned
+// immediately.
+async fn send_dgram_with_retry(
+    socket: &tokio::net::UnixDatagram,
+    data: &[u8],
+    path: &Path,
+) -> std::io::Result<()> {
+    let mut last_err = match socket.send_to(data, path).await {
+        Ok(_) => return Ok(()),
+        Err(e) if !is_buffer_full(&e) => return Err(e),
+        Err(e) => e,
+    };
+    for delay in DGRAM_RETRY_DELAYS {
+        tokio::time::sleep(delay).await;
+        match socket.send_to(data, path).await {
+            Ok(_) => return Ok(()),
+            Err(e) if !is_buffer_full(&e) => return Err(e),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
+}
 
 // ── Error ─────────────────────────────────────────────────────────────────────
 
@@ -127,9 +171,7 @@ impl Forwarder {
         let wire = msg.to_string();
         match &self.0 {
             Inner::UnixDgram(conn) => {
-                conn.socket
-                    .send_to(wire.as_bytes(), Path::new(&conn.path))
-                    .await?;
+                send_dgram_with_retry(&conn.socket, wire.as_bytes(), Path::new(&conn.path)).await?;
                 debug!(bytes = wire.len(), "forwarded via unix_dgram");
             }
             Inner::UnixStream(conn) => {
@@ -197,6 +239,61 @@ mod tests {
             transport,
             socket: socket.to_owned(),
         }
+    }
+
+    /// Fill a tiny receive buffer, spawn a drain thread that sleeps 200 µs
+    /// before emptying it, then call `forward()`.  The first retry at 100 µs
+    /// finds the buffer still full; the second retry at 600 µs (100+500) finds
+    /// it drained and succeeds.  This proves the retry loop actually runs.
+    #[tokio::test]
+    async fn dgram_forward_retries_on_buffer_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("rsyslog.sock");
+
+        let receiver = std::os::unix::net::UnixDatagram::bind(&sock_path).unwrap();
+        // Shrink the receive buffer to the kernel minimum so it fills quickly.
+        socket2::SockRef::from(&receiver)
+            .set_recv_buffer_size(4096)
+            .unwrap();
+
+        // Fill the receive buffer with 1-byte messages until ENOBUFS.
+        let filler = std::os::unix::net::UnixDatagram::unbound().unwrap();
+        filler.set_nonblocking(true).unwrap();
+        let mut fill_count = 0usize;
+        loop {
+            match filler.send_to(&[0u8], &sock_path) {
+                Ok(_) => {
+                    fill_count += 1;
+                    assert!(fill_count < 100_000, "socket buffer never filled");
+                }
+                Err(ref e) if is_buffer_full(e) => break,
+                Err(ref e) => {
+                    assert!(is_buffer_full(e), "unexpected fill error: {e}");
+                    break;
+                }
+            }
+        }
+        assert!(
+            fill_count > 0,
+            "expected at least one fill message to succeed"
+        );
+
+        // Drain after 200 µs — longer than the first retry delay (100 µs) but
+        // shorter than the second (100+500 = 600 µs), so exactly one retry fails.
+        let drainer = receiver.try_clone().unwrap();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_micros(200));
+            let mut buf = vec![0u8; 65_536];
+            drainer.set_nonblocking(true).unwrap();
+            while drainer.recv(&mut buf).is_ok() {}
+        });
+
+        let cfg = rsyslog_cfg(ForwardTransport::UnixDgram, sock_path.to_str().unwrap());
+        let forwarder = Forwarder::from_config(&cfg).unwrap();
+        tokio::time::timeout(Duration::from_millis(200), forwarder.forward(&sample_msg()))
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
