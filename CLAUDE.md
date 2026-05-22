@@ -2,7 +2,7 @@
 **logfence** provides a validating filter daemon, aka man in the middle, for applications logging structured messages to rsyslog.
 logfence also provides a simple client library for applications logging structured messages to rsyslog or the logfence daemon.
 logfence is implemented in Rust and Tokio.
-logfence communicates with host based sockets only and it never sends or receives IP network traffic.
+logfence communicates with host-based Unix domain sockets only and it never sends or receives IP network traffic.
 
 The purpose of this validating filter is to provide a layer of isolation between high assurance/security applications and rsyslog, which may be communicating with the network, compromised applications, etc.
 
@@ -32,6 +32,12 @@ Tokio is chosen for performance when handling a high log rate from many applicat
 Stability and performance are paramount.
 Other dependencies should be kept to a minimum and they should only be used when they meet the other goals and when they greatly simplify the implementation.
 
+# Unix Domain Sockets
+All socket communication is unidirectional.
+The code and OS features should enforce the appropriate data direction on every socket:
+read-only vs write-only.
+Sockets should be configured with 1MB receive buffers or more.
+
 # Code Cleanliness
-Cargo fmt and clippy should be considered after all successful code changes.
+Cargo fmt and cargo clippy should be considered after all successful code changes.
 

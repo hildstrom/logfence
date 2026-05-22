@@ -23,6 +23,21 @@
 //! distribute those messages across 1, 4, or 100 senders to exercise
 //! single-sender throughput and concurrent fan-in at increasing scales.
 //!
+//! ## Measurement methodology
+//!
+//! Each iteration uses [`Bencher::iter_custom`] with explicit timing:
+//!
+//! 1. Snapshot the forwarded-message counter before sending.
+//! 2. Start the wall-clock timer.
+//! 3. Send all messages into the daemon.
+//! 4. Spin-poll until the mock rsyslog drainer has received
+//!    `snapshot + TOTAL_MSGS` messages.
+//! 5. Stop the timer.
+//!
+//! This makes every benchmark a true end-to-end measurement: the timer stops
+//! only after every forwarded datagram has been received by the mock rsyslog
+//! socket, not merely after the last client send returns.
+//!
 //! All benchmarks are intentionally coarse — they catch regressions of ≥10 %
 //! rather than nanosecond noise.
 //!
@@ -43,11 +58,11 @@ use std::{
     path::PathBuf,
     process::{Child, Command},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
@@ -127,6 +142,12 @@ struct BenchSetup {
     daemon: Child,
     stop: Arc<AtomicBool>,
     drainer: Option<thread::JoinHandle<()>>,
+    /// Running count of messages received by the mock rsyslog socket.
+    ///
+    /// Incremented by the drainer thread on every successful `recv`.  Benchmarks
+    /// snapshot this counter before sending, then spin-poll until it reaches
+    /// `snapshot + TOTAL_MSGS` to confirm end-to-end delivery.
+    pub forwarded: Arc<AtomicU64>,
 }
 
 impl BenchSetup {
@@ -216,14 +237,20 @@ impl BenchSetup {
         }
         thread::sleep(Duration::from_millis(50));
 
-        // Background thread drains forwarded datagrams to prevent kernel buffer overflow.
+        // Background thread drains forwarded datagrams and counts them.
+        // The forwarded count lets benchmark iterations wait for true end-to-end
+        // delivery rather than stopping as soon as the last client send returns.
+        let forwarded = Arc::new(AtomicU64::new(0));
+        let forwarded_clone = Arc::clone(&forwarded);
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop);
         let drainer = thread::spawn(move || {
             let mut buf = vec![0u8; 65_536];
             while !stop_clone.load(Ordering::Relaxed) {
-                // Timeout lets us re-check the stop flag; errors are ignored.
-                let _ = rsyslog_sock.recv(&mut buf);
+                // Timeout (50 ms) or error: re-check stop flag and continue.
+                if rsyslog_sock.recv(&mut buf).is_ok() {
+                    forwarded_clone.fetch_add(1, Ordering::Relaxed);
+                }
             }
         });
 
@@ -233,6 +260,18 @@ impl BenchSetup {
             daemon,
             stop,
             drainer: Some(drainer),
+            forwarded,
+        }
+    }
+
+    /// Block until the forwarded counter reaches `target`.
+    ///
+    /// Used by benchmark iterations to confirm that every message sent during
+    /// the iteration has propagated all the way through the daemon and arrived
+    /// at the mock rsyslog socket before the timer is stopped.
+    fn wait_for(&self, target: u64) {
+        while self.forwarded.load(Ordering::Relaxed) < target {
+            thread::sleep(Duration::from_micros(50));
         }
     }
 }
@@ -261,6 +300,7 @@ fn bench_load_1x1000(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().expect("build tokio runtime");
     let transport = UnixTransport::new(&setup.listen_path, 65_536);
 
+    let baseline = setup.forwarded.load(Ordering::Relaxed);
     rt.block_on(async {
         MessageBuilder::new(Facility::Local0, Severity::Info)
             .kv("event", "warmup")
@@ -269,22 +309,32 @@ fn bench_load_1x1000(c: &mut Criterion) {
             .await
             .expect("warmup send");
     });
+    setup.wait_for(baseline + 1);
 
     let mut group = c.benchmark_group("no_schema");
     group.throughput(Throughput::Elements(TOTAL_MSGS));
 
     group.bench_function("load_1x1000", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                for _ in 0..TOTAL_MSGS {
-                    MessageBuilder::new(Facility::Local0, Severity::Info)
-                        .kv("event", "bench")
-                        .expect("kv")
-                        .send(&transport)
-                        .await
-                        .expect("bench send");
-                }
-            });
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let baseline = setup.forwarded.load(Ordering::Relaxed);
+                let target = baseline + TOTAL_MSGS;
+                let start = Instant::now();
+                rt.block_on(async {
+                    for _ in 0..TOTAL_MSGS {
+                        MessageBuilder::new(Facility::Local0, Severity::Info)
+                            .kv("event", "bench")
+                            .expect("kv")
+                            .send(&transport)
+                            .await
+                            .expect("bench send");
+                    }
+                });
+                setup.wait_for(target);
+                total += start.elapsed();
+            }
+            total
         });
     });
 
@@ -310,6 +360,7 @@ fn bench_load_4x250(c: &mut Criterion) {
         .map(|_| UnixTransport::new(&setup.listen_path, 65_536))
         .collect();
 
+    let baseline = setup.forwarded.load(Ordering::Relaxed);
     rt.block_on(async {
         for t in &transports {
             MessageBuilder::new(Facility::Local0, Severity::Info)
@@ -320,24 +371,34 @@ fn bench_load_4x250(c: &mut Criterion) {
                 .expect("warmup");
         }
     });
+    setup.wait_for(baseline + CONNS as u64);
 
     let mut group = c.benchmark_group("no_schema");
     group.throughput(Throughput::Elements(TOTAL_MSGS));
 
     group.bench_function("load_4x250", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                for _ in 0..MSGS_PER_CONN {
-                    for t in &transports {
-                        MessageBuilder::new(Facility::Local0, Severity::Info)
-                            .kv("event", "load")
-                            .expect("kv")
-                            .send(t)
-                            .await
-                            .expect("load send");
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let baseline = setup.forwarded.load(Ordering::Relaxed);
+                let target = baseline + TOTAL_MSGS;
+                let start = Instant::now();
+                rt.block_on(async {
+                    for _ in 0..MSGS_PER_CONN {
+                        for t in &transports {
+                            MessageBuilder::new(Facility::Local0, Severity::Info)
+                                .kv("event", "load")
+                                .expect("kv")
+                                .send(t)
+                                .await
+                                .expect("load send");
+                        }
                     }
-                }
-            });
+                });
+                setup.wait_for(target);
+                total += start.elapsed();
+            }
+            total
         });
     });
 
@@ -363,6 +424,7 @@ fn bench_load_100x10(c: &mut Criterion) {
         .map(|_| UnixTransport::new(&setup.listen_path, 65_536))
         .collect();
 
+    let baseline = setup.forwarded.load(Ordering::Relaxed);
     rt.block_on(async {
         for t in &transports {
             MessageBuilder::new(Facility::Local0, Severity::Info)
@@ -373,24 +435,34 @@ fn bench_load_100x10(c: &mut Criterion) {
                 .expect("warmup");
         }
     });
+    setup.wait_for(baseline + CONNS as u64);
 
     let mut group = c.benchmark_group("no_schema");
     group.throughput(Throughput::Elements(TOTAL_MSGS));
 
     group.bench_function("load_100x10", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                for _ in 0..MSGS_PER_CONN {
-                    for t in &transports {
-                        MessageBuilder::new(Facility::Local0, Severity::Info)
-                            .kv("event", "load")
-                            .expect("kv")
-                            .send(t)
-                            .await
-                            .expect("load send");
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let baseline = setup.forwarded.load(Ordering::Relaxed);
+                let target = baseline + TOTAL_MSGS;
+                let start = Instant::now();
+                rt.block_on(async {
+                    for _ in 0..MSGS_PER_CONN {
+                        for t in &transports {
+                            MessageBuilder::new(Facility::Local0, Severity::Info)
+                                .kv("event", "load")
+                                .expect("kv")
+                                .send(t)
+                                .await
+                                .expect("load send");
+                        }
                     }
-                }
-            });
+                });
+                setup.wait_for(target);
+                total += start.elapsed();
+            }
+            total
         });
     });
 
@@ -402,9 +474,15 @@ fn bench_load_100x10(c: &mut Criterion) {
 // These benchmarks are the datagram-input counterparts of the no_schema group.
 // The daemon is configured with `listen_transport = "unix_dgram"` and clients
 // use UnixDatagramTransport.  There is no framing overhead.  The daemon receive
-// loop drains all queued datagrams per readability event via try_recv_from, but
-// processing remains serialised, so the fan-in benchmarks measure serialised
-// throughput rather than parallel session scaling.
+// loop is single-threaded so messages are processed serially regardless of
+// sender count.
+//
+// The datagram input has no stream-socket backpressure: the client's send_to()
+// calls succeed immediately as long as the daemon's 1 MB kernel receive buffer
+// is not full.  Without explicit synchronisation, the benchmark would measure
+// the kernel buffer fill rate rather than the daemon's processing rate.  The
+// iter_custom approach below closes this gap by waiting for every forwarded
+// message to arrive at the mock rsyslog socket before stopping the timer.
 
 /// One datagram sender sending 1 000 messages per iteration.
 ///
@@ -418,6 +496,7 @@ fn bench_load_1x1000_dgram(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().expect("build tokio runtime");
     let transport = UnixDatagramTransport::new(&setup.listen_path, 65_536);
 
+    let baseline = setup.forwarded.load(Ordering::Relaxed);
     rt.block_on(async {
         MessageBuilder::new(Facility::Local0, Severity::Info)
             .kv("event", "warmup")
@@ -426,22 +505,32 @@ fn bench_load_1x1000_dgram(c: &mut Criterion) {
             .await
             .expect("warmup send");
     });
+    setup.wait_for(baseline + 1);
 
     let mut group = c.benchmark_group("no_schema_dgram");
     group.throughput(Throughput::Elements(TOTAL_MSGS));
 
     group.bench_function("load_1x1000", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                for _ in 0..TOTAL_MSGS {
-                    MessageBuilder::new(Facility::Local0, Severity::Info)
-                        .kv("event", "bench")
-                        .expect("kv")
-                        .send(&transport)
-                        .await
-                        .expect("bench send");
-                }
-            });
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let baseline = setup.forwarded.load(Ordering::Relaxed);
+                let target = baseline + TOTAL_MSGS;
+                let start = Instant::now();
+                rt.block_on(async {
+                    for _ in 0..TOTAL_MSGS {
+                        MessageBuilder::new(Facility::Local0, Severity::Info)
+                            .kv("event", "bench")
+                            .expect("kv")
+                            .send(&transport)
+                            .await
+                            .expect("bench send");
+                    }
+                });
+                setup.wait_for(target);
+                total += start.elapsed();
+            }
+            total
         });
     });
 
@@ -467,6 +556,7 @@ fn bench_load_4x250_dgram(c: &mut Criterion) {
         .map(|_| UnixDatagramTransport::new(&setup.listen_path, 65_536))
         .collect();
 
+    let baseline = setup.forwarded.load(Ordering::Relaxed);
     rt.block_on(async {
         for t in &transports {
             MessageBuilder::new(Facility::Local0, Severity::Info)
@@ -477,24 +567,34 @@ fn bench_load_4x250_dgram(c: &mut Criterion) {
                 .expect("warmup");
         }
     });
+    setup.wait_for(baseline + SENDERS as u64);
 
     let mut group = c.benchmark_group("no_schema_dgram");
     group.throughput(Throughput::Elements(TOTAL_MSGS));
 
     group.bench_function("load_4x250", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                for _ in 0..MSGS_PER_SENDER {
-                    for t in &transports {
-                        MessageBuilder::new(Facility::Local0, Severity::Info)
-                            .kv("event", "load")
-                            .expect("kv")
-                            .send(t)
-                            .await
-                            .expect("load send");
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let baseline = setup.forwarded.load(Ordering::Relaxed);
+                let target = baseline + TOTAL_MSGS;
+                let start = Instant::now();
+                rt.block_on(async {
+                    for _ in 0..MSGS_PER_SENDER {
+                        for t in &transports {
+                            MessageBuilder::new(Facility::Local0, Severity::Info)
+                                .kv("event", "load")
+                                .expect("kv")
+                                .send(t)
+                                .await
+                                .expect("load send");
+                        }
                     }
-                }
-            });
+                });
+                setup.wait_for(target);
+                total += start.elapsed();
+            }
+            total
         });
     });
 
@@ -520,6 +620,7 @@ fn bench_load_100x10_dgram(c: &mut Criterion) {
         .map(|_| UnixDatagramTransport::new(&setup.listen_path, 65_536))
         .collect();
 
+    let baseline = setup.forwarded.load(Ordering::Relaxed);
     rt.block_on(async {
         for t in &transports {
             MessageBuilder::new(Facility::Local0, Severity::Info)
@@ -530,24 +631,34 @@ fn bench_load_100x10_dgram(c: &mut Criterion) {
                 .expect("warmup");
         }
     });
+    setup.wait_for(baseline + SENDERS as u64);
 
     let mut group = c.benchmark_group("no_schema_dgram");
     group.throughput(Throughput::Elements(TOTAL_MSGS));
 
     group.bench_function("load_100x10", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                for _ in 0..MSGS_PER_SENDER {
-                    for t in &transports {
-                        MessageBuilder::new(Facility::Local0, Severity::Info)
-                            .kv("event", "load")
-                            .expect("kv")
-                            .send(t)
-                            .await
-                            .expect("load send");
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let baseline = setup.forwarded.load(Ordering::Relaxed);
+                let target = baseline + TOTAL_MSGS;
+                let start = Instant::now();
+                rt.block_on(async {
+                    for _ in 0..MSGS_PER_SENDER {
+                        for t in &transports {
+                            MessageBuilder::new(Facility::Local0, Severity::Info)
+                                .kv("event", "load")
+                                .expect("kv")
+                                .send(t)
+                                .await
+                                .expect("load send");
+                        }
                     }
-                }
-            });
+                });
+                setup.wait_for(target);
+                total += start.elapsed();
+            }
+            total
         });
     });
 
@@ -578,26 +689,37 @@ fn bench_load_1x1000_validated(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().expect("build tokio runtime");
     let transport = UnixTransport::new(&setup.listen_path, 65_536);
 
+    let baseline = setup.forwarded.load(Ordering::Relaxed);
     rt.block_on(async {
         validated_message_builder()
             .send(&transport)
             .await
             .expect("warmup send");
     });
+    setup.wait_for(baseline + 1);
 
     let mut group = c.benchmark_group("with_schema");
     group.throughput(Throughput::Elements(TOTAL_MSGS));
 
     group.bench_function("load_1x1000", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                for _ in 0..TOTAL_MSGS {
-                    validated_message_builder()
-                        .send(&transport)
-                        .await
-                        .expect("bench send");
-                }
-            });
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let baseline = setup.forwarded.load(Ordering::Relaxed);
+                let target = baseline + TOTAL_MSGS;
+                let start = Instant::now();
+                rt.block_on(async {
+                    for _ in 0..TOTAL_MSGS {
+                        validated_message_builder()
+                            .send(&transport)
+                            .await
+                            .expect("bench send");
+                    }
+                });
+                setup.wait_for(target);
+                total += start.elapsed();
+            }
+            total
         });
     });
 
@@ -621,27 +743,38 @@ fn bench_load_4x250_validated(c: &mut Criterion) {
         .map(|_| UnixTransport::new(&setup.listen_path, 65_536))
         .collect();
 
+    let baseline = setup.forwarded.load(Ordering::Relaxed);
     rt.block_on(async {
         for t in &transports {
             validated_message_builder().send(t).await.expect("warmup");
         }
     });
+    setup.wait_for(baseline + CONNS as u64);
 
     let mut group = c.benchmark_group("with_schema");
     group.throughput(Throughput::Elements(TOTAL_MSGS));
 
     group.bench_function("load_4x250", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                for _ in 0..MSGS_PER_CONN {
-                    for t in &transports {
-                        validated_message_builder()
-                            .send(t)
-                            .await
-                            .expect("load send");
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let baseline = setup.forwarded.load(Ordering::Relaxed);
+                let target = baseline + TOTAL_MSGS;
+                let start = Instant::now();
+                rt.block_on(async {
+                    for _ in 0..MSGS_PER_CONN {
+                        for t in &transports {
+                            validated_message_builder()
+                                .send(t)
+                                .await
+                                .expect("load send");
+                        }
                     }
-                }
-            });
+                });
+                setup.wait_for(target);
+                total += start.elapsed();
+            }
+            total
         });
     });
 
@@ -665,27 +798,38 @@ fn bench_load_100x10_validated(c: &mut Criterion) {
         .map(|_| UnixTransport::new(&setup.listen_path, 65_536))
         .collect();
 
+    let baseline = setup.forwarded.load(Ordering::Relaxed);
     rt.block_on(async {
         for t in &transports {
             validated_message_builder().send(t).await.expect("warmup");
         }
     });
+    setup.wait_for(baseline + CONNS as u64);
 
     let mut group = c.benchmark_group("with_schema");
     group.throughput(Throughput::Elements(TOTAL_MSGS));
 
     group.bench_function("load_100x10", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                for _ in 0..MSGS_PER_CONN {
-                    for t in &transports {
-                        validated_message_builder()
-                            .send(t)
-                            .await
-                            .expect("load send");
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let baseline = setup.forwarded.load(Ordering::Relaxed);
+                let target = baseline + TOTAL_MSGS;
+                let start = Instant::now();
+                rt.block_on(async {
+                    for _ in 0..MSGS_PER_CONN {
+                        for t in &transports {
+                            validated_message_builder()
+                                .send(t)
+                                .await
+                                .expect("load send");
+                        }
                     }
-                }
-            });
+                });
+                setup.wait_for(target);
+                total += start.elapsed();
+            }
+            total
         });
     });
 

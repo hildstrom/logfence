@@ -141,30 +141,31 @@ schemas = ["/etc/logfenced/schemas/audit.schema.json"]
 
 ## Performance
 
-On a Linux VM (9 cores, 8 GB RAM) all benchmarks send 1 000 messages per
-Criterion iteration.
+On a Linux aarch64 VM (9 cores, 8 GB RAM) all benchmarks send 1 000 messages
+per Criterion iteration and measure true end-to-end throughput: the timer stops
+only after every forwarded message has been received by the mock rsyslog socket.
 
 **Unix stream input** (`listen_transport = "unix_stream"`, persistent connections):
 
 | Benchmark | No schema | With schema | Overhead |
 |---|---|---|---|
-| 1 connection | 913 Kelem/s | 442 Kelem/s | 2.1× |
-| 4 connections | 1 233 Kelem/s | 703 Kelem/s | 1.8× |
-| 100 connections | 1 093 Kelem/s | 724 Kelem/s | 1.5× |
+| 1 connection | 831 Kelem/s | 398 Kelem/s | 2.1× |
+| 4 connections | 957 Kelem/s | 629 Kelem/s | 1.5× |
+| 100 connections | 760 Kelem/s | 539 Kelem/s | 1.4× |
 
 Schema validation costs roughly 2× on a single connection. The overhead drops
-to 1.5× at 100 connections as the Tokio scheduler overlaps validation work
+to 1.4× at 100 connections as the Tokio scheduler overlaps validation work
 across concurrent sessions.
 
 **Unix datagram input** (`listen_transport = "unix_dgram"`, no schema):
 
 | Benchmark | Senders | Median thrpt |
 |---|---|---|
-| 1 sender × 1 000 msgs | 1 | 322 Kelem/s |
-| 4 senders × 250 msgs | 4 | 320 Kelem/s |
-| 100 senders × 10 msgs | 100 | 316 Kelem/s |
+| 1 sender × 1 000 msgs | 1 | 311 Kelem/s |
+| 4 senders × 250 msgs | 4 | 310 Kelem/s |
+| 100 senders × 10 msgs | 100 | 308 Kelem/s |
 
-Datagram throughput is roughly 3–4× lower than stream throughput and flat
+Datagram throughput is roughly 2.5–3× lower than stream throughput and flat
 across sender counts because the receive loop is serialised. This is the right
 choice when logfenced acts as a drop-in man-in-the-middle for existing syslog
 clients.
