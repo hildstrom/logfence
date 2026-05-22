@@ -193,20 +193,20 @@ cargo test -p logfence-daemon --test integration_test
 # Run a single integration test by name
 cargo test -p logfence-daemon --test integration_test -- max_connections_backpressure
 
-# Run throughput benchmarks
+# Run throughput benchmarks (all groups)
 cargo bench -p logfence-daemon
 
-# Run only the no-validation benchmarks
-cargo bench -p logfence-daemon -- no_schema/
-cargo bench -p logfence-daemon -- no_schema/single_connection_1k
-cargo bench -p logfence-daemon -- no_schema/sustained_load_4x250
-cargo bench -p logfence-daemon -- no_schema/sustained_load_100x10
+# Run one benchmark group (groups are named <prefix>_<input>_<output>)
+cargo bench -p logfence-daemon -- no_schema_stream_dgram/
+cargo bench -p logfence-daemon -- no_schema_stream_stream/
+cargo bench -p logfence-daemon -- no_schema_dgram_dgram/
+cargo bench -p logfence-daemon -- no_schema_dgram_stream/
+cargo bench -p logfence-daemon -- with_schema_stream_dgram/
 
-# Run only the with-validation benchmarks (strict JSON Schema, 10-field messages)
-cargo bench -p logfence-daemon -- with_schema/
-cargo bench -p logfence-daemon -- with_schema/single_connection_1k
-cargo bench -p logfence-daemon -- with_schema/sustained_load_4x250
-cargo bench -p logfence-daemon -- with_schema/sustained_load_100x10
+# Run a single benchmark within a group
+cargo bench -p logfence-daemon -- no_schema_stream_dgram/load_1x1000
+cargo bench -p logfence-daemon -- no_schema_stream_dgram/load_4x250
+cargo bench -p logfence-daemon -- no_schema_stream_dgram/load_100x10
 
 # Lint (mirrors CI)
 cargo clippy --workspace --all-targets -- -D warnings

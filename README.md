@@ -145,32 +145,54 @@ On a Linux aarch64 VM (9 cores, 8 GB RAM) all benchmarks send 1 000 messages
 per Criterion iteration and measure true end-to-end throughput: the timer stops
 only after every forwarded message has been received by the mock rsyslog socket.
 
-**Unix stream input** (`listen_transport = "unix_stream"`, persistent connections):
+Benchmark groups are named `<prefix>_<input>_<output>`.
 
-| Benchmark | No schema | With schema | Overhead |
+**Stream input, datagram output** (`no_schema_stream_dgram` / `with_schema_stream_dgram`):
+
+| Benchmark | No schema | With schema | Schema overhead |
 |---|---|---|---|
-| 1 connection | 831 Kelem/s | 398 Kelem/s | 2.1× |
-| 4 connections | 957 Kelem/s | 629 Kelem/s | 1.5× |
-| 100 connections | 760 Kelem/s | 539 Kelem/s | 1.4× |
+| 1 connection | 812 Kelem/s | 401 Kelem/s | 2.0× |
+| 4 connections | 958 Kelem/s | 636 Kelem/s | 1.5× |
+| 100 connections | 758 Kelem/s | 542 Kelem/s | 1.4× |
 
 Schema validation costs roughly 2× on a single connection. The overhead drops
 to 1.4× at 100 connections as the Tokio scheduler overlaps validation work
 across concurrent sessions.
 
-**Unix datagram input** (`listen_transport = "unix_dgram"`, no schema):
+**Stream input, stream output** (`no_schema_stream_stream`, no schema):
 
-| Benchmark | Senders | Median thrpt |
-|---|---|---|
-| 1 sender × 1 000 msgs | 1 | 383 Kelem/s |
-| 4 senders × 250 msgs | 4 | 380 Kelem/s |
-| 100 senders × 10 msgs | 100 | 377 Kelem/s |
+| Benchmark | Median thrpt |
+|---|---|
+| 1 connection × 1 000 msgs | 836 Kelem/s |
+| 4 connections × 250 msgs | 512 Kelem/s |
+| 100 connections × 100 msgs | 392 Kelem/s |
 
-Datagram throughput is roughly 2–2.5× lower than stream throughput and nearly
-flat across sender counts. The receive loop is serialised (one `try_recv_from`
-syscall per message is unavoidable), but a fixed worker pool processes
-validated messages in parallel, recovering the per-message spawn overhead of
-an older design. This is the right choice when logfenced acts as a drop-in
-man-in-the-middle for existing syslog clients.
+Stream output matches stream-datagram throughput on a single connection but
+degrades to roughly half at 4+ connections. The stream forwarder serialises all
+output writes through a mutex; datagram output has no such lock.
+
+**Datagram input, datagram output** (`no_schema_dgram_dgram`, no schema):
+
+| Benchmark | Median thrpt |
+|---|---|
+| 1 sender × 1 000 msgs | 375 Kelem/s |
+| 4 senders × 250 msgs | 380 Kelem/s |
+| 100 senders × 10 msgs | 374 Kelem/s |
+
+**Datagram input, stream output** (`no_schema_dgram_stream`, no schema):
+
+| Benchmark | Median thrpt |
+|---|---|
+| 1 sender × 1 000 msgs | 342 Kelem/s |
+| 4 senders × 250 msgs | 348 Kelem/s |
+| 100 senders × 10 msgs | 359 Kelem/s |
+
+Datagram input throughput is roughly 2–2.5× lower than stream input and nearly
+flat across sender counts. The receive loop requires one `try_recv_from` syscall
+per datagram — that boundary is inherent to the protocol. A fixed worker pool
+processes validated messages in parallel after the drain loop. The output
+transport adds at most 10% overhead on the datagram path because the receive
+loop is the bottleneck regardless.
 
 Full benchmark details and methodology: [docs/BENCHMARK.md](docs/BENCHMARK.md)
 

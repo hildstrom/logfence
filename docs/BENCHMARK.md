@@ -1,7 +1,7 @@
 # Benchmark Results
 
 Benchmarks measure end-to-end message throughput: client encode → Unix socket
-→ daemon decode → validate → forward to mock rsyslog Unix datagram socket →
+→ daemon decode → validate → forward to mock rsyslog socket →
 **received by mock rsyslog drainer**.  Each iteration sends 1 000 messages.
 Results are reported by Criterion as elements/second (one element = one syslog
 message).
@@ -15,15 +15,20 @@ implementation for Mac (lightweight Linux VM, 9 cores, 8 GB RAM).
 
 Each benchmark function uses Criterion's `iter_custom` for explicit timing:
 
-1. Snapshot the `forwarded` counter (messages received by mock rsyslog) before
-   sending.
+1. Snapshot the forwarded counter (messages or bytes received by mock rsyslog)
+   before sending.
 2. Start the wall-clock timer.
 3. Send all `TOTAL_MSGS` messages into the daemon.
-4. Spin-poll (`50 µs` interval) until `forwarded ≥ snapshot + TOTAL_MSGS`.
+4. For **datagram output**: spin-poll (`50 µs` interval) until the drainer's
+   message count reaches `snapshot + TOTAL_MSGS`.
+   For **stream output**: spin-poll until the drainer's byte total reaches
+   `snapshot + TOTAL_MSGS × bytes_per_msg`, where `bytes_per_msg` is measured
+   from the first warmup message (one `write_all` frame = octet-count prefix +
+   syslog wire message).
 5. Stop the timer.
 
 This is a true end-to-end measurement: the timer stops only after every
-forwarded datagram has been received by the mock rsyslog socket, not merely
+forwarded message has been received by the mock rsyslog socket, not merely
 after the last client `send` returns.
 
 **Why this matters for the datagram benchmarks.**  The daemon's listen socket
@@ -36,126 +41,159 @@ approach closes that gap.
 
 The stream benchmarks benefit from the same treatment even though Unix stream
 sockets provide implicit backpressure.  The combined kernel send/receive buffer
-capacity (~400 KB on Linux) exceeds one 150 KB iteration, so individual
-iterations can complete before all messages are forwarded; explicit
-synchronisation removes that ambiguity.
+capacity (~400 KB on Linux) can exceed one 150 KB iteration, so individual
+iterations can complete before all messages are forwarded.
 
-## no_schema
+## no_schema_stream_dgram
 
-`[validation] mode = "off"` — daemon checks that the payload is a JSON object
-but performs no schema validation.  Input: Unix stream socket with RFC 6587
-octet-count framing.  Message body: `{"event":"bench"}` or `{"event":"load"}`
-(single field).
+Stream input (`listen_transport = "unix_stream"`), datagram output to mock
+rsyslog (`[rsyslog] transport = "unix_dgram"`).  `[validation] mode = "off"`.
+Message body: `{"event":"bench"}` or `{"event":"load"}`.
 
 | Benchmark | Connections | Msgs/conn | Median thrpt | 95% CI |
 |---|---|---|---|---|
-| `load_1x1000` | 1 | 1 000 | 830.78 Kelem/s | 828.6 – 833.0 |
-| `load_4x250` | 4 | 250 | 956.62 Kelem/s | 954.2 – 958.9 |
-| `load_100x10` | 100 | 10 | 759.64 Kelem/s | 756.6 – 762.8 |
+| `load_1x1000` | 1 | 1 000 | 811.70 Kelem/s | 809.3 – 813.9 |
+| `load_4x250` | 4 | 250 | 957.81 Kelem/s | 954.8 – 960.7 |
+| `load_100x10` | 100 | 10 | 757.89 Kelem/s | 753.0 – 762.8 |
 
-## no_schema_dgram
+## no_schema_stream_stream
 
-`[validation] mode = "off"` — same validation policy as `no_schema`.  Input:
-Unix datagram socket (`listen_transport = "unix_dgram"`); clients use
-`UnixDatagramTransport` with no framing.  The receive loop uses a two-phase
-design: a tight non-blocking drain (`try_recv_from` until `WouldBlock`) collects
-all queued datagrams into a local batch, then round-robin dispatch forwards each
-item to a fixed pool of long-lived worker tasks via per-worker bounded channels.
-Workers validate and forward datagrams in parallel.  This eliminates per-message
-`tokio::spawn` and semaphore overhead, recovering ~23% throughput over the older
-per-spawn design.  The receive loop remains serialised at the syscall level — one
-`try_recv_from` per message is irreducible — so fan-in benchmarks do not show the
-concurrent session scaling seen in the stream group.  Message body:
-`{"event":"bench"}` or `{"event":"load"}`.
+Stream input, stream output to mock rsyslog (`[rsyslog] transport =
+"unix_stream"`; RFC 6587 octet-count framing).  `[validation] mode = "off"`.
+
+| Benchmark | Connections | Msgs/conn | Median thrpt | 95% CI |
+|---|---|---|---|---|
+| `load_1x1000` | 1 | 1 000 | 836.36 Kelem/s | 831.8 – 841.6 |
+| `load_4x250` | 4 | 250 | 512.38 Kelem/s | 511.0 – 513.6 |
+| `load_100x10` | 100 | 10 | 391.68 Kelem/s | 389.8 – 393.6 |
+
+## no_schema_dgram_dgram
+
+Datagram input (`listen_transport = "unix_dgram"`), datagram output.
+`[validation] mode = "off"`.  Message body: `{"event":"bench"}` or
+`{"event":"load"}`.
 
 | Benchmark | Senders | Msgs/sender | Median thrpt | 95% CI |
 |---|---|---|---|---|
-| `load_1x1000` | 1 | 1 000 | 383.38 Kelem/s | 382.2 – 384.5 |
-| `load_4x250` | 4 | 250 | 379.91 Kelem/s | 378.9 – 381.0 |
-| `load_100x10` | 100 | 10 | 376.98 Kelem/s | 375.8 – 378.1 |
+| `load_1x1000` | 1 | 1 000 | 375.04 Kelem/s | 373.8 – 376.2 |
+| `load_4x250` | 4 | 250 | 379.91 Kelem/s | 378.5 – 381.2 |
+| `load_100x10` | 100 | 10 | 373.99 Kelem/s | 372.9 – 375.1 |
 
-## with_schema
+## no_schema_dgram_stream
 
-`[validation] mode = "strict"` with a ten-field JSON Schema
-(`additionalProperties: false`).  Input: Unix stream socket.  Message body:
-ten-field JSON object (`auth_method`, `duration_ms`, `event`, `region`,
-`request_id`, `service`, `session_id`, `source_ip`, `success`, `user`).
+Datagram input, stream output.  `[validation] mode = "off"`.
+
+| Benchmark | Senders | Msgs/sender | Median thrpt | 95% CI |
+|---|---|---|---|---|
+| `load_1x1000` | 1 | 1 000 | 342.27 Kelem/s | 339.9 – 344.6 |
+| `load_4x250` | 4 | 250 | 348.35 Kelem/s | 346.6 – 350.1 |
+| `load_100x10` | 100 | 10 | 358.67 Kelem/s | 356.8 – 360.5 |
+
+## with_schema_stream_dgram
+
+Stream input, datagram output, `[validation] mode = "strict"` with a ten-field
+JSON Schema (`additionalProperties: false`).  Message body: ten-field JSON
+object (`auth_method`, `duration_ms`, `event`, `region`, `request_id`,
+`service`, `session_id`, `source_ip`, `success`, `user`).
 
 | Benchmark | Connections | Msgs/conn | Median thrpt | 95% CI |
 |---|---|---|---|---|
-| `load_1x1000` | 1 | 1 000 | 398.30 Kelem/s | 397.6 – 399.0 |
-| `load_4x250` | 4 | 250 | 628.50 Kelem/s | 627.4 – 629.5 |
-| `load_100x10` | 100 | 10 | 539.31 Kelem/s | 536.6 – 541.8 |
+| `load_1x1000` | 1 | 1 000 | 401.08 Kelem/s | 399.8 – 402.3 |
+| `load_4x250` | 4 | 250 | 635.93 Kelem/s | 634.7 – 637.1 |
+| `load_100x10` | 100 | 10 | 542.09 Kelem/s | 538.9 – 545.1 |
 
-## Schema validation overhead (stream)
+## Schema validation overhead (stream input, datagram output)
 
 | Benchmark | no_schema | with_schema | Overhead |
 |---|---|---|---|
-| `load_1x1000` | 830.78 Kelem/s | 398.30 Kelem/s | 2.1× |
-| `load_4x250` | 956.62 Kelem/s | 628.50 Kelem/s | 1.5× |
-| `load_100x10` | 759.64 Kelem/s | 539.31 Kelem/s | 1.4× |
+| `load_1x1000` | 811.70 Kelem/s | 401.08 Kelem/s | 2.0× |
+| `load_4x250` | 957.81 Kelem/s | 635.93 Kelem/s | 1.5× |
+| `load_100x10` | 757.89 Kelem/s | 542.09 Kelem/s | 1.4× |
 
 Schema validation (JSON parse + `jsonschema` evaluation) costs roughly 2× on a
 single connection.  Concurrency recovers a significant portion of that penalty:
 the overhead drops to 1.5× at 4 connections and 1.4× at 100 connections, as
 the Tokio scheduler overlaps validation work across concurrent sessions.
 
-The `with_schema` throughput peaks at 4 connections (629 Kelem/s) and falls
-back at 100 connections (539 Kelem/s).  At 100 connections with only 10
-messages each, the per-connection task-spawn and scheduling overhead grows
-relative to the validation work, so the scheduler benefit from parallelism is
-partially offset by that overhead.
+## Stream output vs datagram output (stream input)
 
-## Stream vs datagram input
-
-| Benchmark | no_schema (stream) | no_schema_dgram | Ratio |
+| Benchmark | stream_dgram | stream_stream | Ratio |
 |---|---|---|---|
-| `load_1x1000` | 830.78 Kelem/s | 383.38 Kelem/s | 2.2× |
-| `load_4x250` | 956.62 Kelem/s | 379.91 Kelem/s | 2.5× |
-| `load_100x10` | 759.64 Kelem/s | 376.98 Kelem/s | 2.0× |
+| `load_1x1000` | 811.70 Kelem/s | 836.36 Kelem/s | 1.0× (stream_stream faster) |
+| `load_4x250` | 957.81 Kelem/s | 512.38 Kelem/s | 1.9× |
+| `load_100x10` | 757.89 Kelem/s | 391.68 Kelem/s | 1.9× |
 
-The datagram path is roughly 2–2.5× slower than the stream path under
-comparable loads.  One structural difference is irreducible; the other has been
-substantially addressed.
+On a single connection, stream output is slightly faster than datagram output
+(836 vs 812 Kelem/s).  A persistent stream connection requires no per-message
+socket address resolution, and `write_all` on a connected socket is marginally
+cheaper than `send_to` on an unconnected one.
 
-**Per-message syscall on receive (irreducible).**  With a stream socket, a
-single `read()` syscall can return tens of kilobytes covering dozens of framed
-messages.  The codec decodes all of them from its buffer without touching the OS
-again, amortising I/O overhead across many messages.  With datagrams, each
-message requires its own `try_recv_from()` syscall — the datagram boundary is
-the syscall boundary — so syscall overhead scales linearly with message count.
+With 4 or 100 concurrent input connections, stream output falls to roughly half
+the datagram throughput.  The cause is the `Mutex<Option<OwnedWriteHalf>>` in
+the stream forwarder: all session tasks share a single write half, so output
+writes are fully serialised regardless of how many input connections are
+processing messages concurrently.  Datagram output has no such lock; each
+`send_to()` goes directly to the kernel without mutual exclusion.
+
+Use `unix_stream` output when the downstream rsyslog instance is configured for
+`imtcp` or `imuxsock` (stream-mode) or when a single persistent connection is
+preferred.  Use `unix_dgram` output (the default) for maximum throughput when
+logfenced is acting as a drop-in filter in front of a standard rsyslog
+datagram socket.
+
+## Input transport comparison (datagram output, no schema)
+
+| Benchmark | stream_dgram | dgram_dgram | Ratio |
+|---|---|---|---|
+| `load_1x1000` | 811.70 Kelem/s | 375.04 Kelem/s | 2.2× |
+| `load_4x250` | 957.81 Kelem/s | 379.91 Kelem/s | 2.5× |
+| `load_100x10` | 757.89 Kelem/s | 373.99 Kelem/s | 2.0× |
+
+The datagram input path is roughly 2–2.5× slower than the stream input path.
+Two structural differences drive this:
+
+**Per-message syscall on receive.**  With a stream socket, a single `read()`
+syscall can return tens of kilobytes covering dozens of framed messages.  The
+codec decodes all of them from its buffer without touching the OS again,
+amortising I/O overhead across many messages.  With datagrams, each message
+requires its own `try_recv_from()` syscall — the datagram boundary is the
+syscall boundary — so syscall overhead scales linearly with message count.
 The tight drain loop amortises the *scheduler* cost (one `readable()` wakeup
 covers the full queued burst) but cannot collapse multiple datagrams into a
 single syscall without platform-specific APIs (`recvmmsg`).
 
-**Parallel processing (addressed with worker pool).**  The stream listener
-spawns a separate Tokio task per connection, so 4 or 100 sessions execute
-concurrently and overlap I/O and validation work.  The datagram listener uses a
-fixed pool of long-lived worker tasks with per-worker bounded channels.  The
-tight drain loop fills channels without yielding to the scheduler; workers drain
-and validate in parallel.  This eliminated per-message `tokio::spawn` and
-semaphore acquisition, recovering ~23% throughput over the older per-spawn
-design (~310 → ~380 Kelem/s).  However, the receive loop is still a single
-goroutine at the syscall level, so fan-in benchmarks remain nearly flat across
-sender counts (377–383 Kelem/s) whereas the stream group peaks at 957 Kelem/s
-at 4 connections.
+**Parallel processing.**  The stream listener spawns a separate Tokio task per
+connection, so 4 or 100 sessions execute concurrently and overlap I/O and
+validation work.  The datagram listener's receive loop is serialised at the
+syscall level: all datagrams arrive on one socket, dispatched round-robin to
+a fixed pool of worker tasks.  As a result, the datagram group's throughput
+is nearly flat across all three load variants (374–380 Kelem/s) while the
+stream group peaks at 958 Kelem/s at 4 connections.
 
-**The datagram figures reflect the true receive-loop rate.**  Because the
-daemon's receive loop is the bottleneck for the datagram path (not the kernel
-buffer fill rate), and the benchmark explicitly waits for forwarding to
-complete, the ~380 Kelem/s figure reflects the daemon's actual serialised
-receive throughput for datagram input.
+## Stream output overhead on datagram input
 
-**Note on the 100-connection stream case.**  Stream throughput at 100
-connections (760 Kelem/s) is lower than at 4 connections (957 Kelem/s).  With
-only 10 messages per connection, each connection's session task spends a large
-fraction of its lifetime on task-spawn and scheduling overhead rather than on
-message I/O, causing the Tokio scheduler to become the bottleneck before the
-connection count scales throughput further.
+| Benchmark | dgram_dgram | dgram_stream | Overhead |
+|---|---|---|---|
+| `load_1x1000` | 375.04 Kelem/s | 342.27 Kelem/s | 1.10× |
+| `load_4x250` | 379.91 Kelem/s | 348.35 Kelem/s | 1.09× |
+| `load_100x10` | 373.99 Kelem/s | 358.67 Kelem/s | 1.04× |
 
-The appropriate transport choice depends on the deployment context.  Unix stream
-input delivers higher throughput for applications that maintain a persistent
-connection to logfenced.  Unix datagram input is the correct choice when
-logfenced is acting as a drop-in man-in-the-middle for existing syslog clients
-that already send to `/run/syslog` or a similar datagram socket — the lower
-throughput ceiling is generally not a concern for that workload.
+On the datagram input path the output transport has minimal impact (~4–10%
+overhead for stream vs datagram output).  The bottleneck remains the serialised
+datagram receive loop, not the output write path.  The framing overhead of
+RFC 6587 octet-count formatting and the stream write mutex are small compared
+to the per-datagram `try_recv_from` syscall cost.
+
+The slight improvement at 100 senders reflects the benchmark structure: with
+100 concurrent async senders in the benchmark harness the sends are more
+interleaved, keeping the daemon's receive buffer fuller and reducing idle
+cycles in the drain loop.
+
+## Transport selection summary
+
+| Input | Output | Best use case |
+|---|---|---|
+| `unix_stream` | `unix_dgram` | High throughput; rsyslog using datagram socket (`imuxsock`) |
+| `unix_stream` | `unix_stream` | Single persistent connection; rsyslog using stream socket |
+| `unix_dgram` | `unix_dgram` | Drop-in for existing datagram syslog clients |
+| `unix_dgram` | `unix_stream` | Drop-in clients with stream-mode rsyslog downstream |
