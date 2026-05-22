@@ -144,10 +144,10 @@ impl Transport for UnixTransport {
 /// input and by a `logfenced` instance configured with
 /// `listen_transport = "unix_dgram"`.
 ///
-/// The socket is created unbound and its read half is shut down (`SHUT_RD`)
-/// immediately, enforcing write-only direction at both the type level and the
-/// OS level.  There is no framing — the datagram boundary is the message
-/// boundary.
+/// The socket is created unbound.  On Linux, `SHUT_RD` is issued immediately
+/// to enforce write-only direction at the OS level; macOS rejects that call on
+/// unconnected sockets, so write-only is type-enforced only on that platform.
+/// There is no framing — the datagram boundary is the message boundary.
 ///
 /// Thread-safe: the socket is protected by a [`tokio::sync::Mutex`].
 pub struct UnixDatagramTransport {
@@ -184,9 +184,15 @@ impl Transport for UnixDatagramTransport {
         let mut guard = self.socket.lock().await;
 
         if guard.is_none() {
-            // Create an unbound socket and enforce write-only direction.
             let sock = UnixDatagram::unbound()?;
-            sock.shutdown(std::net::Shutdown::Read)?;
+            // Enforce write-only direction at OS level. macOS returns ENOTCONN
+            // for unconnected datagram sockets; safe to ignore since an unbound
+            // socket has no address and cannot receive unsolicited data.
+            if let Err(e) = sock.shutdown(std::net::Shutdown::Read) {
+                if e.kind() != std::io::ErrorKind::NotConnected {
+                    return Err(ClientError::Io(e));
+                }
+            }
             *guard = Some(sock);
         }
 

@@ -145,9 +145,14 @@ impl Forwarder {
         let inner = match cfg.transport {
             ForwardTransport::UnixDgram => {
                 let socket = tokio::net::UnixDatagram::unbound()?;
-                // Enforce write-only direction: logfenced never reads from the
-                // rsyslog socket.
-                socket.shutdown(std::net::Shutdown::Read)?;
+                // Enforce write-only direction at OS level. macOS returns ENOTCONN
+                // for unconnected datagram sockets; safe to ignore since an unbound
+                // socket has no address and cannot receive unsolicited data.
+                if let Err(e) = socket.shutdown(std::net::Shutdown::Read) {
+                    if e.kind() != std::io::ErrorKind::NotConnected {
+                        return Err(e.into());
+                    }
+                }
                 Inner::UnixDgram(Arc::new(DgramConn {
                     socket,
                     path: cfg.socket.clone(),
