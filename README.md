@@ -161,14 +161,16 @@ across concurrent sessions.
 
 | Benchmark | Senders | Median thrpt |
 |---|---|---|
-| 1 sender × 1 000 msgs | 1 | 311 Kelem/s |
-| 4 senders × 250 msgs | 4 | 310 Kelem/s |
-| 100 senders × 10 msgs | 100 | 308 Kelem/s |
+| 1 sender × 1 000 msgs | 1 | 383 Kelem/s |
+| 4 senders × 250 msgs | 4 | 380 Kelem/s |
+| 100 senders × 10 msgs | 100 | 377 Kelem/s |
 
-Datagram throughput is roughly 2.5–3× lower than stream throughput and flat
-across sender counts because the receive loop is serialised. This is the right
-choice when logfenced acts as a drop-in man-in-the-middle for existing syslog
-clients.
+Datagram throughput is roughly 2–2.5× lower than stream throughput and nearly
+flat across sender counts. The receive loop is serialised (one `try_recv_from`
+syscall per message is unavoidable), but a fixed worker pool processes
+validated messages in parallel, recovering the per-message spawn overhead of
+an older design. This is the right choice when logfenced acts as a drop-in
+man-in-the-middle for existing syslog clients.
 
 Full benchmark details and methodology: [docs/BENCHMARK.md](docs/BENCHMARK.md)
 

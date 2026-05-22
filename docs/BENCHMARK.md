@@ -57,18 +57,22 @@ octet-count framing.  Message body: `{"event":"bench"}` or `{"event":"load"}`
 
 `[validation] mode = "off"` — same validation policy as `no_schema`.  Input:
 Unix datagram socket (`listen_transport = "unix_dgram"`); clients use
-`UnixDatagramTransport` with no framing.  The receive loop waits for a single
-readability event and then drains all queued datagrams via `try_recv_from`
-before returning to the scheduler, amortising the per-wakeup cost across
-bursts.  The loop remains serialised (no parallel session tasks), so the fan-in
-benchmarks do not benefit from the concurrent session scaling seen in the stream
-group.  Message body: `{"event":"bench"}` or `{"event":"load"}`.
+`UnixDatagramTransport` with no framing.  The receive loop uses a two-phase
+design: a tight non-blocking drain (`try_recv_from` until `WouldBlock`) collects
+all queued datagrams into a local batch, then round-robin dispatch forwards each
+item to a fixed pool of long-lived worker tasks via per-worker bounded channels.
+Workers validate and forward datagrams in parallel.  This eliminates per-message
+`tokio::spawn` and semaphore overhead, recovering ~23% throughput over the older
+per-spawn design.  The receive loop remains serialised at the syscall level — one
+`try_recv_from` per message is irreducible — so fan-in benchmarks do not show the
+concurrent session scaling seen in the stream group.  Message body:
+`{"event":"bench"}` or `{"event":"load"}`.
 
 | Benchmark | Senders | Msgs/sender | Median thrpt | 95% CI |
 |---|---|---|---|---|
-| `load_1x1000` | 1 | 1 000 | 311.30 Kelem/s | 310.3 – 312.2 |
-| `load_4x250` | 4 | 250 | 309.80 Kelem/s | 309.2 – 310.4 |
-| `load_100x10` | 100 | 10 | 307.64 Kelem/s | 307.0 – 308.3 |
+| `load_1x1000` | 1 | 1 000 | 383.38 Kelem/s | 382.2 – 384.5 |
+| `load_4x250` | 4 | 250 | 379.91 Kelem/s | 378.9 – 381.0 |
+| `load_100x10` | 100 | 10 | 376.98 Kelem/s | 375.8 – 378.1 |
 
 ## with_schema
 
@@ -106,34 +110,41 @@ partially offset by that overhead.
 
 | Benchmark | no_schema (stream) | no_schema_dgram | Ratio |
 |---|---|---|---|
-| `load_1x1000` | 830.78 Kelem/s | 311.30 Kelem/s | 2.7× |
-| `load_4x250` | 956.62 Kelem/s | 309.80 Kelem/s | 3.1× |
-| `load_100x10` | 759.64 Kelem/s | 307.64 Kelem/s | 2.5× |
+| `load_1x1000` | 830.78 Kelem/s | 383.38 Kelem/s | 2.2× |
+| `load_4x250` | 956.62 Kelem/s | 379.91 Kelem/s | 2.5× |
+| `load_100x10` | 759.64 Kelem/s | 376.98 Kelem/s | 2.0× |
 
-The datagram path is roughly 2.5–3× slower than the stream path under
-comparable loads.  Two structural differences drive this:
+The datagram path is roughly 2–2.5× slower than the stream path under
+comparable loads.  One structural difference is irreducible; the other has been
+substantially addressed.
 
-**Per-message syscall on receive.**  With a stream socket, a single `read()`
-syscall can return tens of kilobytes covering dozens of framed messages.  The
-codec decodes all of them from its buffer without touching the OS again,
-amortising I/O overhead across many messages.  With datagrams, each message
-requires its own `try_recv_from()` syscall — the datagram boundary is the
-syscall boundary — so syscall overhead scales linearly with message count.  The
-drain loop amortises the *scheduler* cost (one `readable()` wakeup covers the
-full queued burst) but cannot collapse multiple datagrams into a single syscall.
+**Per-message syscall on receive (irreducible).**  With a stream socket, a
+single `read()` syscall can return tens of kilobytes covering dozens of framed
+messages.  The codec decodes all of them from its buffer without touching the OS
+again, amortising I/O overhead across many messages.  With datagrams, each
+message requires its own `try_recv_from()` syscall — the datagram boundary is
+the syscall boundary — so syscall overhead scales linearly with message count.
+The tight drain loop amortises the *scheduler* cost (one `readable()` wakeup
+covers the full queued burst) but cannot collapse multiple datagrams into a
+single syscall without platform-specific APIs (`recvmmsg`).
 
-**Flat fan-in.**  The stream listener spawns a separate Tokio task per
-connection, so 4 or 100 sessions execute concurrently and overlap I/O and
-validation work.  The datagram listener is a single receive loop that handles
-messages serially regardless of how many senders are active.  As a result,
-the datagram group's throughput is nearly flat across all three load variants
-(308–311 Kelem/s) while the stream group peaks at 957 Kelem/s at 4 connections.
+**Parallel processing (addressed with worker pool).**  The stream listener
+spawns a separate Tokio task per connection, so 4 or 100 sessions execute
+concurrently and overlap I/O and validation work.  The datagram listener uses a
+fixed pool of long-lived worker tasks with per-worker bounded channels.  The
+tight drain loop fills channels without yielding to the scheduler; workers drain
+and validate in parallel.  This eliminated per-message `tokio::spawn` and
+semaphore acquisition, recovering ~23% throughput over the older per-spawn
+design (~310 → ~380 Kelem/s).  However, the receive loop is still a single
+goroutine at the syscall level, so fan-in benchmarks remain nearly flat across
+sender counts (377–383 Kelem/s) whereas the stream group peaks at 957 Kelem/s
+at 4 connections.
 
-**The datagrams figures are close to the true processing rate.**  Because
-the daemon's receive loop is the bottleneck for the datagram path (not the
-kernel buffer fill rate), and the benchmark explicitly waits for forwarding to
-complete, the ~310 Kelem/s figure reflects the daemon's actual serialised
-processing throughput for datagram input.
+**The datagram figures reflect the true receive-loop rate.**  Because the
+daemon's receive loop is the bottleneck for the datagram path (not the kernel
+buffer fill rate), and the benchmark explicitly waits for forwarding to
+complete, the ~380 Kelem/s figure reflects the daemon's actual serialised
+receive throughput for datagram input.
 
 **Note on the 100-connection stream case.**  Stream throughput at 100
 connections (760 Kelem/s) is lower than at 4 connections (957 Kelem/s).  With

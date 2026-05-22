@@ -8,33 +8,35 @@
 //!
 //! ## Receive loop design
 //!
-//! The outer loop waits for socket readability via [`readable`] — a single
-//! `epoll`/`kqueue` notification.  Once readable, an inner drain loop calls
-//! [`try_recv_from`] repeatedly until `WouldBlock`, consuming every datagram
-//! already in the kernel receive buffer before yielding back to the Tokio
-//! scheduler.  This amortises the scheduler round-trip cost: when N datagrams
-//! are queued, the current approach wakes the reactor N times; the drain loop
-//! wakes it once.
+//! The design separates receiving from processing with two phases per wakeup:
 //!
-//! Each datagram's bytes are copied into an owned [`Bytes`] buffer and all
-//! subsequent work (UTF-8 validation, syslog parsing, schema validation,
-//! forwarding) is dispatched to a Tokio task via [`process_datagram`].  The
-//! drain loop returns to [`try_recv_from`] immediately after spawning, without
-//! re-entering the scheduler, so the kernel buffer empties as fast as possible.
+//! **Phase 1 — tight drain (no `.await`).**  After `readable()` fires, an inner
+//! loop calls [`try_recv_from`] until `WouldBlock`, copying each datagram into
+//! an owned [`Bytes`] buffer and collecting `(bytes, peer)` pairs into a local
+//! batch.  There is no scheduler interaction in this loop; the kernel buffer is
+//! emptied as fast as possible.
+//!
+//! **Phase 2 — round-robin dispatch.**  The batch is distributed across a fixed
+//! pool of worker tasks, one item per worker channel per step.  [`try_send`] is
+//! used for the fast path (channel has space); a blocking [`send`] fallback
+//! handles the rare case where a worker channel is full.  Workers process
+//! datagrams in parallel as soon as items arrive in their channels.
+//!
+//! **Worker pool.**  `max_connections` long-lived Tokio tasks each own a
+//! dedicated bounded channel.  Workers call [`process_datagram`] directly —
+//! there is no [`tokio::spawn`] per message and no semaphore acquisition in the
+//! hot path.  On graceful shutdown the receive loop drops all channel senders,
+//! causing workers to drain their remaining items and exit naturally.
 //!
 //! A 1 MB kernel receive buffer ([`RECV_BUFFER_SIZE`]) absorbs bursts without
-//! dropping datagrams when the processing tasks temporarily fall behind.
-//!
-//! A semaphore bounded by [`DaemonConfig::max_connections`] limits the number
-//! of concurrently active processing tasks, providing backpressure when the
-//! pipeline is saturated.  On graceful shutdown the loop stops accepting new
-//! datagrams and waits up to 30 seconds for in-flight tasks to complete.
+//! dropping datagrams when workers temporarily fall behind.
 
 use std::{io, path::Path, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use serde_json::json;
-use tokio::sync::{watch, Semaphore};
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -53,10 +55,17 @@ use crate::{
 
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Per-worker channel buffer depth.
+///
+/// Each of the `max_connections` worker tasks owns a bounded channel of this
+/// capacity.  Total in-flight capacity across all workers is
+/// `max_connections × WORKER_CHANNEL_CAP` datagrams.
+const WORKER_CHANNEL_CAP: usize = 256;
+
 /// Kernel receive buffer size for the datagram listen socket.
 ///
-/// 1 MB absorbs bursts when processing tasks temporarily fall behind, matching
-/// the receive buffer set on the mock rsyslog socket in benchmarks.
+/// 1 MB absorbs bursts when workers temporarily fall behind, matching the
+/// receive buffer set on the mock rsyslog socket in benchmarks.
 const RECV_BUFFER_SIZE: usize = 1024 * 1024;
 
 // ── DatagramListener ──────────────────────────────────────────────────────────
@@ -92,7 +101,7 @@ impl DatagramListener {
         apply_socket_permissions(path, &cfg.socket_mode)?;
 
         // Set a 1 MB receive buffer to absorb bursts without dropping datagrams
-        // when processing tasks temporarily fall behind.
+        // when workers temporarily fall behind.
         socket2::SockRef::from(&socket).set_recv_buffer_size(RECV_BUFFER_SIZE)?;
 
         // Enforce read-only direction: logfenced never sends on the listen socket.
@@ -109,13 +118,12 @@ impl DatagramListener {
     }
 
     /// Receive datagrams until `shutdown` is cancelled, dispatching each to a
-    /// processing task, then drain in-flight tasks before returning.
+    /// worker task, then drain in-flight work before returning.
     ///
-    /// The outer loop waits for socket readability, then an inner drain loop
-    /// calls [`try_recv_from`] until `WouldBlock`, consuming every queued
-    /// datagram before yielding back to the scheduler.  A semaphore bounded by
-    /// [`DaemonConfig::max_connections`] limits concurrent tasks; reaching that
-    /// limit causes the drain loop to yield until a task finishes.
+    /// The receive loop has two phases per wakeup: a tight non-blocking drain
+    /// that collects all queued datagrams into a local batch, followed by
+    /// round-robin dispatch of that batch to the fixed worker pool.  Workers
+    /// process datagrams in parallel; there is no per-message spawn overhead.
     pub async fn run(
         self,
         shutdown: CancellationToken,
@@ -130,7 +138,38 @@ impl DatagramListener {
         } = self;
 
         let mut buf = vec![0u8; cfg.max_message_size];
-        let semaphore = Arc::new(Semaphore::new(cfg.max_connections));
+        let num_workers = cfg.max_connections;
+
+        // Template SessionConfig for workers; `peer` is overwritten per message.
+        let base_cfg = SessionConfig {
+            framing: cfg.framing,
+            max_message_size: cfg.max_message_size,
+            sender_mode: cfg.sender,
+            local_hostname: Arc::clone(&local_hostname),
+            peer: Arc::from("<anonymous>"),
+        };
+
+        // Spawn a fixed pool of worker tasks, each with its own bounded channel.
+        // Long-lived workers eliminate per-message tokio::spawn and semaphore
+        // overhead; the channel provides backpressure when workers fall behind.
+        let mut senders: Vec<mpsc::Sender<(Bytes, Arc<str>)>> = Vec::with_capacity(num_workers);
+        let mut join_set: JoinSet<()> = JoinSet::new();
+
+        for _ in 0..num_workers {
+            let (tx, rx) = mpsc::channel::<(Bytes, Arc<str>)>(WORKER_CHANNEL_CAP);
+            senders.push(tx);
+            join_set.spawn(run_worker(
+                rx,
+                base_cfg.clone(),
+                validator_rx.clone(),
+                forwarder.clone(),
+                Arc::clone(&metrics),
+            ));
+        }
+
+        let mut worker_idx = 0usize;
+        // Reused across drain cycles; avoids per-wakeup allocation.
+        let mut batch: Vec<(Bytes, Arc<str>)> = Vec::with_capacity(64);
 
         'recv: loop {
             // ── Wait for the socket to become readable or for shutdown ─────────
@@ -145,10 +184,8 @@ impl DatagramListener {
                 }
             };
 
-            // ── Drain: consume every queued datagram before returning to the ───
-            // ── scheduler, amortising the per-wakeup cost across a full burst. ─
+            // ── Phase 1: tight drain — no `.await`, empties the kernel buffer ──
             loop {
-                // ── Step 1: receive one datagram (non-blocking) ───────────────
                 let (n, addr) = match socket.try_recv_from(&mut buf) {
                     Ok(pair) => pair,
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -160,52 +197,71 @@ impl DatagramListener {
 
                 let peer: Arc<str> = addr
                     .as_pathname()
-                    .map_or_else(|| "<anonymous>".to_owned(), |p| p.display().to_string())
-                    .into();
+                    .map_or_else(|| "<anonymous>".into(), |p| p.display().to_string().into());
+                batch.push((Bytes::copy_from_slice(&buf[..n]), peer));
+            }
 
-                // Copy bytes into an owned buffer so `buf` is free for the next recv.
-                let msg_bytes = Bytes::copy_from_slice(&buf[..n]);
-
-                // ── Step 2: acquire a processing permit (backpressure) ────────
-                //
-                // Also cancels on shutdown so the loop does not block
-                // indefinitely when all permits are held during a clean shutdown.
-                let permit = tokio::select! {
-                    biased;
-                    () = shutdown.cancelled() => break 'recv,
-                    result = semaphore.clone().acquire_owned() => if let Ok(p) = result { p } else {
-                        error!("datagram processing semaphore closed — shutting down");
-                        return;
-                    },
+            // ── Phase 2: dispatch batch round-robin to worker channels ─────────
+            // try_send is non-blocking for the common case (channel has space).
+            // Falls back to send().await when a worker channel is full, which
+            // yields to the scheduler and lets workers consume queued items.
+            for item in batch.drain(..) {
+                let item = match senders[worker_idx].try_send(item) {
+                    Ok(()) => {
+                        worker_idx = (worker_idx + 1) % num_workers;
+                        continue;
+                    }
+                    Err(mpsc::error::TrySendError::Full(item)) => item,
+                    Err(mpsc::error::TrySendError::Closed(_)) => break 'recv,
                 };
-
-                // ── Step 3: spawn processing task ─────────────────────────────
-                let vr = validator_rx.clone();
-                let fwd = forwarder.clone();
-                let m = Arc::clone(&metrics);
-                let msg_cfg = SessionConfig {
-                    framing: cfg.framing,
-                    max_message_size: cfg.max_message_size,
-                    sender_mode: cfg.sender,
-                    local_hostname: Arc::clone(&local_hostname),
-                    peer,
-                };
-
-                tokio::spawn(async move {
-                    process_datagram(msg_bytes, msg_cfg, vr, fwd, m).await;
-                    drop(permit);
-                });
+                if senders[worker_idx].send(item).await.is_err() {
+                    break 'recv;
+                }
+                worker_idx = (worker_idx + 1) % num_workers;
             }
         }
 
         // ── Graceful drain ────────────────────────────────────────────────────
+        // Dropping all senders closes each worker's channel; workers drain
+        // remaining items and exit their recv loop naturally.
+        drop(senders);
         info!("datagram listener shutting down; waiting for in-flight tasks");
-        let total = u32::try_from(cfg.max_connections).unwrap_or(u32::MAX);
-        match tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, semaphore.acquire_many(total)).await {
-            Ok(Ok(_)) => info!("all datagram tasks finished; shutdown complete"),
-            Ok(Err(_)) => {} // semaphore closed; no tasks in flight
-            Err(_) => warn!("graceful shutdown timed out; forcing exit"),
+        if tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, async {
+            while let Some(result) = join_set.join_next().await {
+                if let Err(e) = result {
+                    error!(error = %e, "datagram worker task failed");
+                }
+            }
+        })
+        .await
+        .is_ok()
+        {
+            info!("all datagram workers finished; shutdown complete");
+        } else {
+            warn!("graceful shutdown timed out; forcing exit");
+        }
+    }
+}
+
+// ── Worker task ───────────────────────────────────────────────────────────────
+
+/// Long-lived worker that processes datagrams from its dedicated channel.
+///
+/// Runs until its channel is closed (all senders dropped during shutdown),
+/// draining any remaining items before returning.
+async fn run_worker(
+    mut rx: mpsc::Receiver<(Bytes, Arc<str>)>,
+    base_cfg: SessionConfig,
+    validator_rx: watch::Receiver<Arc<Validator>>,
+    forwarder: Forwarder,
+    metrics: Arc<MetricsStore>,
+) {
+    while let Some((msg_bytes, peer)) = rx.recv().await {
+        let msg_cfg = SessionConfig {
+            peer,
+            ..base_cfg.clone()
         };
+        process_datagram(msg_bytes, msg_cfg, &validator_rx, &forwarder, &metrics).await;
     }
 }
 
@@ -213,14 +269,14 @@ impl DatagramListener {
 
 /// Validate and forward one received datagram.
 ///
-/// Called from a spawned Tokio task per datagram so the receive loop is not
-/// blocked on parsing, validation, or forwarding.
+/// Called from a worker task; takes shared references to avoid per-message
+/// Arc clones of the validator, forwarder, and metrics handles.
 async fn process_datagram(
     msg_bytes: Bytes,
     msg_cfg: SessionConfig,
-    validator_rx: watch::Receiver<Arc<Validator>>,
-    forwarder: Forwarder,
-    metrics: Arc<MetricsStore>,
+    validator_rx: &watch::Receiver<Arc<Validator>>,
+    forwarder: &Forwarder,
+    metrics: &MetricsStore,
 ) {
     let Ok(raw) = std::str::from_utf8(&msg_bytes) else {
         warn!(peer = %msg_cfg.peer, "dropping datagram with invalid UTF-8");
@@ -229,7 +285,7 @@ async fn process_datagram(
             "peer": msg_cfg.peer.as_ref(),
             "error": "invalid UTF-8 encoding",
         });
-        report_rejection(&forwarder, &msg_cfg.local_hostname, payload).await;
+        report_rejection(forwarder, &msg_cfg.local_hostname, payload).await;
         return;
     };
 
@@ -242,12 +298,12 @@ async fn process_datagram(
                 "peer": msg_cfg.peer.as_ref(),
                 "error": format!("syslog parse error: {e}"),
             });
-            report_rejection(&forwarder, &msg_cfg.local_hostname, payload).await;
+            report_rejection(forwarder, &msg_cfg.local_hostname, payload).await;
             return;
         }
     };
 
-    handle_message(msg, &validator_rx, &forwarder, &metrics, &msg_cfg).await;
+    handle_message(msg, validator_rx, forwarder, metrics, &msg_cfg).await;
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -303,7 +359,7 @@ mod tests {
             listen_socket: listen.to_owned(),
             socket_mode: "0600".to_owned(),
             socket_group: None,
-            max_connections: 256,
+            max_connections: 4,
             max_message_size: 65_536,
             listen_transport: crate::config::ListenTransport::UnixDgram,
             framing: FramingMode::OctetCount,
