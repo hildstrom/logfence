@@ -84,14 +84,13 @@ pub struct DatagramListener {
 
 impl DatagramListener {
     /// Bind the socket at `cfg.listen_socket`, apply permissions, set a 1 MB
-    /// receive buffer, enforce read-only direction (`SHUT_WR`), and return a
+    /// receive buffer, attempt read-only direction (`SHUT_WR`), and return a
     /// ready [`DatagramListener`].
     ///
     /// # Errors
     ///
     /// Returns `std::io::Error` if the socket cannot be bound, if permissions
-    /// cannot be set, if the receive buffer cannot be resized, or if the
-    /// directional shutdown fails.
+    /// cannot be set, or if the receive buffer cannot be resized.
     pub fn bind(cfg: DaemonConfig, forwarder: Forwarder) -> std::io::Result<Self> {
         let path = Path::new(&cfg.listen_socket);
         if path.exists() {
@@ -104,8 +103,14 @@ impl DatagramListener {
         // when workers temporarily fall behind.
         socket2::SockRef::from(&socket).set_recv_buffer_size(RECV_BUFFER_SIZE)?;
 
-        // Enforce read-only direction: logfenced never sends on the listen socket.
-        socket.shutdown(std::net::Shutdown::Write)?;
+        // Enforce read-only direction at OS level. macOS returns ENOTCONN for
+        // bound-but-unconnected datagram sockets; safe to ignore since the
+        // socket is never used for sending.
+        if let Err(e) = socket.shutdown(std::net::Shutdown::Write) {
+            if e.kind() != std::io::ErrorKind::NotConnected {
+                return Err(e);
+            }
+        }
 
         let local_hostname = detect_hostname();
         info!(socket = %cfg.listen_socket, "listening for client datagrams");
