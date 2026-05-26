@@ -262,7 +262,7 @@ Full benchmark details and methodology: [docs/BENCHMARK.md](docs/BENCHMARK.md)
 
 - RELP
 - disk caching
-- plugins
+- plugins like [mmhashchainsigs](https://github.com/hildstrom/mmhashchainsigs)
 
 ---
 
