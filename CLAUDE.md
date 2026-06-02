@@ -41,3 +41,7 @@ Sockets should be configured with 1MB receive buffers or more.
 # Code Cleanliness
 Cargo fmt and cargo clippy should be considered after all successful code changes.
 
+# Accuracy
+Scrutinize existing source code for a thorough understanding of what is currently implemented
+before making plans, making changes, or updating documentation.
+
