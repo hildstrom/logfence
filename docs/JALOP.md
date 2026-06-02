@@ -288,7 +288,7 @@ rsyslog 8.2312, OpenSSL 3.0.13, Ed25519, SHA-256, signinterval=1024:
 |---|---|
 | baseline omfile (no signing) | ~376,000 msg/s |
 | mmhashchainsigs + omfile | ~343,000 msg/s |
-| mmhashchainsigs-verify | ~578,000 lines/s |
+| mmhashchainsigs-verify | ~526,000 lines/s |
 
 Signing overhead is ~9%. SHA-384 and SHA-512 will increase per-message
 hash cost slightly but not change the order of magnitude. ECDSA
@@ -633,12 +633,8 @@ ergonomics, ease of integration, and operational simplicity.
 
 ## References
 
-- [mmhashchainsigs README](mmhashchainsigs/README.md)
-- [mmhashchainsigs X.509 design](mmhashchainsigs/docs/X509.md)
-- [mmhashchainsigs benchmark](mmhashchainsigs/docs/BENCHMARK.md)
+- [mmhashchainsigs](https://github.com/hildstrom/mmhashchainsigs)
 - [logfence](https://github.com/hildstrom/logfence)
-- [logfence JALoP comparison (JALOP.md)](logfence/docs/JALOP.md)
-- [mmhashchainsigs JALoP comparison (JALOP.md)](mmhashchainsigs/docs/JALOP.md)
 - [JALoP Reference Implementation](https://github.com/JALoP/JALoP)
 - [JALoP Auditd Plugin](https://github.com/JALoP/JALoP-Auditd-Plugin)
 - NIST SP 800-92, *Guide to Computer Security Log Management*
