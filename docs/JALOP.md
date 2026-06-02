@@ -29,7 +29,7 @@ light of these additions.
 
 | Layer | rsyslog stack | JALoP |
 |---|---|---|
-| Schema enforcement | logfence validates RFC 5424 fields and JSON Schema (draft 7 / 2019-09) per message before rsyslog sees it | Opt-in JAF XSD validation for audit records only, in the JPL client library; log and journal records are not validated |
+| Schema enforcement | logfence validates RFC 5424 fields and JSON Schema (draft 4, 6, 7, 2019-09, 2020-12) per message before rsyslog sees it | Opt-in JAF XSD validation for audit records only, in the JPL client library; log and journal records are not validated |
 | Local relay | rsyslogd with imuxsock / imptcp / imrelp inputs | jal-local-store (LMDB-backed) |
 | Integrity at rest | mmhashchainsigs: configurable hash chain (SHA-256/384/512) + periodic signature (Ed25519 or ECDSA P-256/P-384/P-521), optional X.509 cert embedding | XML record + enveloped XML-DSig signature in LMDB |
 | Wire transport | omrelp over RELP/TLS with mutual authentication | BEEP (v1) or HTTP/1.1 + TLS (v2) |

@@ -69,8 +69,9 @@ fn rewrite_sender(
     let orig_app = escape_sd_param(msg.app_name.as_deref().unwrap_or("-"));
     let orig_pid = escape_sd_param(msg.proc_id.as_deref().unwrap_or("-"));
 
-    let src_element =
-        format!(r#"[logfence-src@65944 hostname="{orig_hostname}" app="{orig_app}" pid="{orig_pid}"]"#);
+    let src_element = format!(
+        r#"[logfence-src@65944 hostname="{orig_hostname}" app="{orig_app}" pid="{orig_pid}"]"#
+    );
     let new_sd = if msg.structured_data == "-" {
         src_element
     } else {

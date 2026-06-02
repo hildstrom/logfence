@@ -19,7 +19,7 @@ package "logfence-proto" #DDEEFF {
     + app_name: Option<String>
     + proc_id: Option<String>
     + msg_id: Option<String>
-    + structured_data: Option<String>
+    + structured_data: String
     + msg: String
     --
     + parse(input: &str) -> Result<Self>
@@ -30,7 +30,7 @@ package "logfence-proto" #DDEEFF {
     + facility: Facility
     + severity: Severity
     --
-    + as_u8() -> u8
+    + as_integer() -> u8
   }
 
   enum Facility {
@@ -161,10 +161,11 @@ package "logfence-daemon" #FFEECC {
   }
 
   class Forwarder {
-    - inner: Arc<Inner>
+    - inner: Inner
     --
     + from_config(cfg) -> Result<Self>
     + forward(msg) -> Result<()>
+    note: Clone: dgram shares Arc<socket>;\nstream clones get fresh connection slot
   }
 
   class "Inner (UnixDgram)" as InnerDgram {

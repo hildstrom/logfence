@@ -37,7 +37,7 @@ rectangle "Tokio Runtime" {
 
 }
 
-component "Arc<Forwarder>\n(shared across sessions)\n──────────────\nUnixDgram: stateless\nUnixStream: Mutex<Option<stream>>" as Forwarder #FFD0D0
+component "Forwarder (Clone)\n(cloned per session)\n──────────────\nUnixDgram: Arc<socket> shared\nUnixStream: independent Mutex<Option<stream>>" as Forwarder #FFD0D0
 
 Main --> Watch : SIGHUP → send(Arc<new_validator>)
 Main --> Cancel : SIGTERM → cancel()

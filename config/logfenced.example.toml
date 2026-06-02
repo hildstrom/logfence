@@ -64,8 +64,8 @@ socket = "/run/syslog"
 # "warn"   — log schema mismatch but forward the message anyway.
 # "off"    — only require a valid JSON object; skip schema comparison entirely.
 mode = "strict"
-# Paths to JSON Schema files used for linear-scan validation (draft 7 and 2019-09
-# are supported).  All schemas are tried in order; a message passes if any one matches.
+# Paths to JSON Schema files used for linear-scan validation (draft 4, 6, 7,
+# 2019-09, and 2020-12 are supported).  All schemas are tried in order; a message passes if any one matches.
 # Leave empty to accept any well-formed JSON object.
 schemas = [
     # "/etc/logfenced/schemas/audit.schema.json",

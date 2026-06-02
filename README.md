@@ -74,7 +74,7 @@ pipeline flowchart, and the concurrency model.
 **Validation**
 - All syslog fields are validated
 - Requires the MSG field to be a valid JSON object
-- Optional strict JSON Schema enforcement (draft 7 and 2019-09)
+- Optional strict JSON Schema enforcement (draft 4, 6, 7, 2019-09, and 2020-12)
 - Multiple schemas with linear-scan matching (first match wins)
 - Discriminator-field routing: O(1) map lookup by a nominated JSON field
   (e.g. `"service"`), with linear-scan fallback for unrecognised values
@@ -252,9 +252,9 @@ Full benchmark details and methodology: [docs/BENCHMARK.md](docs/BENCHMARK.md)
 
 ## Target Platforms
 
-- Red Hat Enterprise Linux
-- Ubuntu
-- macOS
+- Red Hat Enterprise Linux 10
+- Ubuntu 24.04 LTS
+- macOS 26
 
 ---
 

@@ -103,14 +103,17 @@ logfence/
 │       │                             serve_stats_socket: Unix socket stats endpoint,
 │       │                             enabled at runtime via metrics.enabled = true.
 │       ├── benches/
-│       │   └── message_throughput.rs Six Criterion benchmarks in two groups
-│       │                             (no_schema and with_schema), each with 1, 4, and
-│       │                             100 concurrent connections sending 1 000 messages
-│       │                             per iteration. Uses a background drainer thread
-│       │                             and SO_RCVBUF=1 MB on the mock rsyslog socket to
-│       │                             handle high message rates on all platforms.
+│       │   └── message_throughput.rs 15 Criterion benchmarks in five groups
+│       │                             (no_schema_stream_dgram, no_schema_stream_stream,
+│       │                             no_schema_dgram_dgram, no_schema_dgram_stream,
+│       │                             with_schema_stream_dgram), each with 1, 4, and
+│       │                             100 concurrent connections/senders sending
+│       │                             1 000 messages per iteration. Uses a background
+│       │                             drainer thread and SO_RCVBUF=1 MB on the mock
+│       │                             rsyslog socket to handle high message rates on
+│       │                             all platforms.
 │       └── tests/
-│           └── integration_test.rs  19 end-to-end tests that spawn logfenced as a
+│           └── integration_test.rs  20 end-to-end tests that spawn logfenced as a
 │                                     child process and communicate via real Unix sockets.
 │                                     Uses env!("CARGO_BIN_EXE_logfenced") so Cargo builds
 │                                     the binary automatically before tests run.
@@ -154,7 +157,7 @@ logfence/
 │       │                             logfenced → rsyslog with socket types noted.
 │       ├── 02-crate-dependencies.puml Package/Component — the four crates, their key
 │       │                             contents, and dependency edges.
-│       ├── 03-daemon-modules.puml    Component — all six modules inside logfenced and
+│       ├── 03-daemon-modules.puml    Component — all seven modules inside logfenced and
 │       │                             their call relationships.
 │       ├── 04-key-types.puml         Class — key structs, enums, and traits across all
 │       │                             crates with relationships.

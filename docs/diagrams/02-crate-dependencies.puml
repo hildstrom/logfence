@@ -36,17 +36,18 @@ package "logfence workspace" {
     [main.rs]
   }
 
-  package "logfence-itests" <<crate>> #F0F0F0 {
-    [integration tests]
-    [benchmarks]
+  package "logfence-client-c" <<crate>> #F0F0F0 {
+    [C API wrapper\n(cdylib + staticlib)]
+    [LfClient / LfMsgAttr]
+    [lf_client_new / lf_send\nlf_client_free / lf_strerror]
   }
 
 }
 
 [logfence-client] --> [logfence-proto] : uses SyslogMessage,\nOctetCountCodec
+[logfence-client-c] --> [logfence-client] : uses UnixTransport
+[logfence-client-c] --> [logfence-proto] : uses SyslogMessage,\nFacility, Severity
 [logfence-daemon] --> [logfence-proto] : uses SyslogMessage,\nOctetCountCodec,\nDelimiterCodec
-[logfence-itests] --> [logfence-client] : MessageBuilder,\nUnixTransport
-[logfence-itests] --> [logfence-proto] : Facility, Severity
 
 note right of [logfence-proto]
   No external runtime deps.
@@ -56,6 +57,11 @@ end note
 note right of [logfence-client]
   No chrono dependency.
   Uses std::time for timestamps.
+end note
+
+note right of [logfence-client-c]
+  unsafe FFI boundary only.
+  Tokio Runtime for blocking send.
 end note
 
 note right of [logfence-daemon]
