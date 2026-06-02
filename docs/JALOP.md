@@ -1,7 +1,8 @@
 # logfence + rsyslog + mmhashchainsigs + RELP vs. JALoP (Revision 3)
 
-This analysis is of the latest JALoP Reference Implementation 2.x.x.x,
-latest logfence, and latest mmhashchainsigs in May 2026.
+This analysis is of the latest JALoP Reference Implementation (2.4.0.0,
+released May 20 2026), latest logfence, and latest mmhashchainsigs in
+May 2026.
 
 This is the third comparison of these two approaches to tamper-evident
 audit logging. The first analysis found
@@ -30,7 +31,7 @@ light of these additions.
 |---|---|---|
 | Schema enforcement | logfence validates RFC 5424 fields and JSON Schema (draft 7 / 2019-09) per message before rsyslog sees it | Opt-in JAF XSD validation for audit records only, in the JPL client library; log and journal records are not validated |
 | Local relay | rsyslogd with imuxsock / imptcp / imrelp inputs | jal-local-store (LMDB-backed) |
-| Integrity at rest | mmhashchainsigs: configurable hash chain (SHA-256/384/512) + periodic signature (Ed25519 or ECDSA P-256/P-384/P-521), optional X.509 cert embedding | XML record + detached XML-DSig signature in LMDB |
+| Integrity at rest | mmhashchainsigs: configurable hash chain (SHA-256/384/512) + periodic signature (Ed25519 or ECDSA P-256/P-384/P-521), optional X.509 cert embedding | XML record + enveloped XML-DSig signature in LMDB |
 | Wire transport | omrelp over RELP/TLS with mutual authentication | BEEP (v1) or HTTP/1.1 + TLS (v2) |
 | Storage | Plain files via omfile with sd-preserve template | LMDB database files (default 200 MB cap) |
 | Verification | Standalone mmhashchainsigs-verify CLI; supports raw pubkey, pinned cert, or CA-bundle trust modes | LMDB inspection plus XML-DSig validation against a stored cert |
@@ -172,7 +173,7 @@ calls.
 
 | Aspect | JALoP (JPL) | logfence-client |
 |---|---|---|
-| Language bindings | C, C++, Java | Rust, C (FFI covers C++, Python, Go, etc.) |
+| Language bindings | C/C++ in this repo's JPL; Java via the separate jJALoP (producer) and jjnl (subscriber) repos, or JNI | Rust, C (FFI covers C++, Python, Go, etc.) |
 | Record types | 3 (audit, log, journal) | 1 (RFC 5424 syslog with JSON body) |
 | Message format | Opaque byte buffers + C struct metadata → XML | RFC 5424 header + JSON key-value pairs |
 | Audit schema validation | Opt-in JAF XSD validation in the JPL client | JSON Schema validation in the logfenced daemon |
@@ -245,7 +246,7 @@ strengthened its implementation:
   `H(n) = HASH(H(n-1) || seq_be64 || payload(n))`,
   where HASH is SHA-256, SHA-384, or SHA-512.
 - payload covers: captured syslog header fields (in
-  `mmhashchainsigs-hdr@32473`), any non-self client structured data,
+  `mmhashchainsigs-hdr@65944`), any non-self client structured data,
   and the message body.
 - Periodic asymmetric signature (Ed25519 or ECDSA) over the current
   chain hash, with a final signature on graceful shutdown.
@@ -303,8 +304,8 @@ rsyslog stack does one hash update per message and one signature per
 
 **On-disk size.** mmhashchainsigs files are ~2.3x the
 RSYSLOG_TraditionalFileFormat baseline. JALoP stores each record as an
-XML document plus a detached XML-DSig blob in LMDB, with page-aligned
-entries. The rsyslog stack produces smaller per-record output in all
+XML document whose system-metadata wrapper carries an enveloped
+XML-DSig signature, stored in LMDB. The rsyslog stack produces smaller per-record output in all
 realistic configurations.
 
 ---
@@ -333,13 +334,15 @@ realistic configurations.
   libxmlsec1, OpenSSL, LMDB, libmicrohttpd. The README notes that
   the libmicrohttpd shipped in some enterprise distributions is
   insufficient.
-- Known limitations documented in the README: "potential record loss
-  with duplicate identifiers, temporary transmission of outdated
-  records under certain conditions, and challenges with subscriber
-  interruption under high volume scenarios."
-- Recent work (v2.3.1.0, Jan 2026) added a Rust inline filter
-  (jaldb_inline_filter) with SECCOMP sandboxing to protect the LMDB
-  database from a compromised publisher. This acknowledges the
+- Known limitations documented in the README KNOWN ISSUES section
+  (paraphrased): record loss when the publisher reuses a unique
+  identifier for different records, temporary transfer of outdated
+  records during journal resume in live mode, and the publisher
+  refusing further connections from a subscriber repeatedly
+  interrupted with Ctrl-C under high record volume.
+- The Rust inline filter (jaldb_inline_filter) added in v2.3.1.0
+  (Jan 2026) wraps system calls in SECCOMP sandboxing to protect the
+  LMDB database from a compromised publisher. This acknowledges the
   attack surface of the publisher-to-store boundary.
 - Local store has a default 200 MB cap; operators manage rotation and
   offload.
@@ -533,7 +536,7 @@ v2.3.1.0). The JALoP README includes multi-page build instructions with
 platform-specific workarounds.
 
 **Format longevity.** RFC 5424 plus a vendor SD-ID
-(`mmhashchainsigs@32473`) is a stable text format that survives log
+(`mmhashchainsigs@65944`) is a stable text format that survives log
 rotation, grep, journalctl, and SIEM ingestion unchanged. LMDB files
 require JALoP-specific readers.
 
@@ -566,7 +569,7 @@ producer configuration and restarting the local store.
 - A procurement explicitly mandates "JALoP-conformant" audit exchange
   (some government contracts specify the protocol by name).
 - The consumer side is already JALoP-native and expects XML records with
-  detached XML-DSig.
+  enveloped XML-DSig.
 - RSA signing is required by policy (mmhashchainsigs does not support
   RSA).
 - The audit requirement includes large binary payloads (forensic images,

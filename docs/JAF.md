@@ -1,6 +1,7 @@
 # JALoP Audit Format (JAF) and XML Schemas
 
-This analysis is of the latest JALoP Reference Implementation 2.x.x.x in May 2026.
+This analysis is of the latest JALoP Reference Implementation (2.4.0.0,
+released May 20 2026).
 
 This document records what is known about the JALoP Audit Format and
 the XML schemas used by the JALoP reference implementation, based on
@@ -18,8 +19,10 @@ two filenames under the configured `schema_root` directory:
 1. `eventList.xsd` (preferred, newer)
 2. `event.xsd` (fallback, older)
 
-**Neither schema is included in the open-source repository.** Both
-files contain only:
+**The actual JAF schema content is not included in the open-source
+repository.** The repository ships `eventList.xsd` (and a `core.xsd`)
+as one-line placeholder stubs; the older `event.xsd` fallback filename
+is absent entirely. Each stub contains only:
 
 ```
 Contact cds_tech@nsa.gov to obtain this JAF schema.
@@ -41,8 +44,12 @@ When the flag is set, `jalp_audit()`:
 1. Parses the `audit_buffer` as XML using `xmlReadMemory`.
 2. Loads and caches the JAF XSD schema context on first use.
 3. Validates the parsed document against the schema.
-4. Returns `JAL_E_XML_PARSE` or `JAL_SCHEMA_VALIDATION_FAILURE` on
-   failure.
+4. Returns `JAL_E_XML_PARSE` if the buffer does not parse as XML, or
+   `JAL_E_XML_SCHEMA` if it parses but fails schema validation
+   (`jalp_xml_validate.c`). Note that the doc comment in
+   `jalp_audit.h` names a `JAL_SCHEMA_VALIDATION_FAILURE` status that
+   does not exist in `jal_status.h`; the actual returned value is
+   `JAL_E_XML_SCHEMA`.
 
 When the flag is **not** set (the default), no parsing or validation
 occurs. The buffer is sent to the local store as-is.

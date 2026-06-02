@@ -905,8 +905,8 @@ async fn sender_logfenced_rewrites_sender_fields() {
         "forwarded message should have 'logfenced' as app_name: {raw}"
     );
     assert!(
-        raw.contains("[logfence.src "),
-        "forwarded message should contain logfence.src SD element: {raw}"
+        raw.contains("[logfence-src@65944 "),
+        "forwarded message should contain logfence-src@65944 SD element: {raw}"
     );
     assert!(
         raw.contains(r#"app="itest""#),
@@ -933,8 +933,8 @@ async fn sender_original_preserves_sender_fields() {
         "original app_name 'itest' should appear in forwarded message: {raw}"
     );
     assert!(
-        !raw.contains("[logfence.src "),
-        "logfence.src SD element must not appear with sender = original: {raw}"
+        !raw.contains("[logfence-src@65944 "),
+        "logfence-src@65944 SD element must not appear with sender = original: {raw}"
     );
 
     f.shutdown().await;

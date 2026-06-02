@@ -90,7 +90,7 @@ pipeline flowchart, and the concurrency model.
 - Configurable sender identity: forward messages with the original sender
   fields unchanged (`original`, default) or replace them with logfenced's
   own identity (`logfenced`); original hostname, app name, and PID are
-  preserved in RFC 5424 STRUCTURED-DATA as `[logfence.src ...]` so no
+  preserved in RFC 5424 STRUCTURED-DATA as `[logfence-src@65944 ...]` so no
   audit information is lost
 
 **Operations**

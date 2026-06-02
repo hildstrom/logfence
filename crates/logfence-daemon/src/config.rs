@@ -167,7 +167,7 @@ pub enum SenderMode {
     /// Rewrite sender fields to identify logfenced as the message source.
     ///
     /// The original hostname, `app_name`, and `proc_id` are preserved in RFC 5424
-    /// STRUCTURED-DATA as `[logfence.src hostname="..." app="..." pid="..."]`.
+    /// STRUCTURED-DATA as `[logfence-src@65944 hostname="..." app="..." pid="..."]`.
     Logfenced,
 }
 

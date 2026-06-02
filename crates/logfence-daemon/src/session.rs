@@ -70,7 +70,7 @@ fn rewrite_sender(
     let orig_pid = escape_sd_param(msg.proc_id.as_deref().unwrap_or("-"));
 
     let src_element =
-        format!(r#"[logfence.src hostname="{orig_hostname}" app="{orig_app}" pid="{orig_pid}"]"#);
+        format!(r#"[logfence-src@65944 hostname="{orig_hostname}" app="{orig_app}" pid="{orig_pid}"]"#);
     let new_sd = if msg.structured_data == "-" {
         src_element
     } else {
@@ -805,8 +805,8 @@ mod tests {
             rewritten.structured_data
         );
         assert!(
-            rewritten.structured_data.contains("[logfence.src "),
-            "SD should contain logfence.src element: {}",
+            rewritten.structured_data.contains("[logfence-src@65944 "),
+            "SD should contain logfence-src@65944 element: {}",
             rewritten.structured_data
         );
     }
@@ -847,8 +847,8 @@ mod tests {
             rewritten.structured_data
         );
         assert!(
-            rewritten.structured_data.contains("[logfence.src "),
-            "logfence.src SD element should be appended: {}",
+            rewritten.structured_data.contains("[logfence-src@65944 "),
+            "logfence-src@65944 SD element should be appended: {}",
             rewritten.structured_data
         );
     }
