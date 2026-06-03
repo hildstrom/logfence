@@ -8,8 +8,8 @@ the message is forwarded. Invalid messages are dropped and the rejection is
 reported to rsyslog. Valid messages are forwarded unchanged (or with optional
 normalization). No message reaches rsyslog unless it has passed inspection.
 
-This project is based on ideas from [MITRE's CEE](https://cee.mitre.org)
-and the [JALoP Reference Implementation](https://github.com/JALoP/JALoP).
+This project is based on ideas from [MITRE's Common Event Expression (CEE)](https://cee.mitre.org)
+and the [Journal, Audit, and Logging Protocol (JALoP) Reference Implementation](https://github.com/JALoP/JALoP).
 The goal is to combine the simplicity and performance of CEE + rsyslog with
 the separation of the JALoP RI.
 
@@ -76,7 +76,7 @@ pipeline flowchart, and the concurrency model.
 - Requires the MSG field to be a valid JSON object
 - Optional strict JSON Schema enforcement (draft 4, 6, 7, 2019-09, and 2020-12)
 - Multiple schemas with linear-scan matching (first match wins)
-- Discriminator-field routing: O(1) map lookup by a nominated JSON field
+- Discriminator-field schema routing: O(1) map lookup by a nominated JSON field
   (e.g. `"service"`), with linear-scan fallback for unrecognised values
 - Three enforcement modes: `strict` (drop), `warn` (log and forward), `off`
   (JSON-only check)
