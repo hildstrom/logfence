@@ -172,6 +172,20 @@ impl Fixture {
             .expect("send SIGTERM to daemon");
     }
 
+    /// Poll up to `limit` for the daemon process to exit. Returns `true` if it
+    /// exited within the limit, `false` if it was still running at the deadline.
+    /// Reaps the process when it has exited.
+    async fn wait_exit(&mut self, limit: Duration) -> bool {
+        let deadline = std::time::Instant::now() + limit;
+        loop {
+            match self.daemon.try_wait() {
+                Ok(Some(_)) => return true,
+                _ if std::time::Instant::now() >= deadline => return false,
+                _ => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+    }
+
     /// Try to receive one forwarded message with a 2 s timeout.
     /// Returns `None` on timeout or I/O error.
     async fn try_recv(&self) -> Option<String> {
@@ -1057,4 +1071,135 @@ async fn stream_output_delivers_all_messages() {
         }
     }
     let _ = daemon.kill();
+}
+
+// ── SIGTERM shutdown scenario tests ─────────────────────────────────────────────
+//
+// These cover the three graceful-shutdown scenarios: idle, under load with a
+// cooperative client disconnect, and under load with a client that stays
+// connected past the drain timeout. The fixture's default `listen_transport`
+// is `unix_stream`, so each test exercises the stream listener's accept loop
+// and drain path (`listener.rs`).
+
+/// Scenario 1 — idle (no active connections). A SIGTERM delivered while the
+/// daemon sits in its accept loop with no clients must be observed immediately:
+/// the accept loop's biased `select!` sees the cancelled token and the drain
+/// completes at once because every semaphore permit is free.
+///
+/// This is the regression test for the accept-loop blocking bug where the
+/// listener blocked on `accept().await` outside any `select!`: without the fix
+/// the daemon never observes SIGTERM while idle and would hang until
+/// force-killed.
+#[tokio::test]
+async fn sigterm_idle_exits_promptly() {
+    let mut f = Fixture::start("[validation]\nmode = \"off\"\n").await;
+
+    // No message is ever sent, so the daemon is idle in its accept loop.
+    f.send_sigterm();
+    assert!(
+        f.wait_exit(Duration::from_secs(5)).await,
+        "idle daemon must exit promptly on SIGTERM, well under the 30 s drain timeout"
+    );
+}
+
+/// Scenario 2 — under load, client disconnects cooperatively. With an active
+/// session holding a connection open, SIGTERM breaks the accept loop and the
+/// drain waits for that session. When the client then closes its connection the
+/// session reads EOF, releases its permit, and the drain completes — a clean
+/// exit well before the 30 s timeout.
+#[tokio::test]
+async fn sigterm_under_load_cooperative_disconnect_drains() {
+    let mut f = Fixture::start("[validation]\nmode = \"off\"\n").await;
+
+    // Establish a persistent connection with one forwarded message. The session
+    // is now active and blocked in `read_buf` holding a semaphore permit.
+    let t = UnixTransport::new(&f.listen_path, 65_536);
+    send_event_on(&f.listen_path, "active", Some(&t)).await;
+    f.try_recv()
+        .await
+        .expect("active session message should be forwarded");
+
+    f.send_sigterm();
+
+    // While the client stays connected the daemon must keep draining, not exit.
+    assert!(
+        !f.wait_exit(Duration::from_millis(300)).await,
+        "daemon must wait for the active session to drain, not exit immediately"
+    );
+
+    // Cooperative disconnect: the session reads EOF and releases its permit.
+    drop(t);
+
+    assert!(
+        f.wait_exit(Duration::from_secs(5)).await,
+        "daemon must finish draining and exit promptly after the client disconnects"
+    );
+}
+
+/// Scenario 3 — under load, client stays connected. The session remains blocked
+/// in `read_buf` with no EOF, so the drain cannot complete until the 30 s
+/// `SHUTDOWN_DRAIN_TIMEOUT` fires. This test verifies the graceful-degradation
+/// path up to that point: the daemon keeps running (draining) rather than
+/// exiting prematurely or dropping the held connection. The full
+/// timeout-forced exit is covered by the ignored slow test below.
+#[tokio::test]
+async fn sigterm_under_load_client_connected_keeps_draining() {
+    let mut f = Fixture::start("[validation]\nmode = \"off\"\n").await;
+
+    let t = UnixTransport::new(&f.listen_path, 65_536);
+    send_event_on(&f.listen_path, "active", Some(&t)).await;
+    f.try_recv()
+        .await
+        .expect("active session message should be forwarded");
+
+    f.send_sigterm();
+
+    // The client never disconnects: the daemon must remain alive and draining,
+    // well short of the 30 s drain timeout.
+    assert!(
+        !f.wait_exit(Duration::from_secs(3)).await,
+        "daemon must keep draining while the client stays connected, not exit early"
+    );
+
+    // Clean up: disconnect so the daemon drains and exits without the test
+    // having to wait the full 30 s timeout.
+    drop(t);
+    assert!(
+        f.wait_exit(Duration::from_secs(5)).await,
+        "daemon must exit once the held connection finally closes"
+    );
+}
+
+/// Scenario 3, full path — when a client stays connected past the 30 s
+/// `SHUTDOWN_DRAIN_TIMEOUT`, the drain times out and the daemon force-exits,
+/// abandoning the still-blocked session.
+///
+/// Ignored by default because it waits the full timeout; run on demand with
+/// `cargo test -- --ignored`.
+#[tokio::test]
+#[ignore = "waits the full 30 s SHUTDOWN_DRAIN_TIMEOUT"]
+async fn sigterm_under_load_drain_timeout_forces_exit() {
+    let mut f = Fixture::start("[validation]\nmode = \"off\"\n").await;
+
+    let t = UnixTransport::new(&f.listen_path, 65_536);
+    send_event_on(&f.listen_path, "active", Some(&t)).await;
+    f.try_recv()
+        .await
+        .expect("active session message should be forwarded");
+
+    f.send_sigterm();
+
+    // Hold the connection open across the entire drain timeout. The daemon must
+    // still be running shortly before the deadline...
+    assert!(
+        !f.wait_exit(Duration::from_secs(28)).await,
+        "daemon must keep draining until the 30 s timeout fires"
+    );
+    // ...and must force-exit shortly after it.
+    assert!(
+        f.wait_exit(Duration::from_secs(7)).await,
+        "daemon must force-exit when the drain timeout fires with a client still connected"
+    );
+
+    drop(t);
 }

@@ -163,6 +163,32 @@ let transport = UnixDatagramTransport::new(path, 65_536)
     .max_attempts(0);  // retry indefinitely
 ```
 
+### Linux kernel tuning
+
+On Linux the number of datagrams that may be queued on a Unix datagram socket is
+bounded by the `net.unix.max_dgram_qlen` kernel parameter — *not* by the socket
+buffer size (`SO_RCVBUF`). The default is often `10`, so only about eleven
+datagrams can be pending at once no matter how large the receive buffer is.
+
+For datagram deployments under high concurrency this queue is the limiting
+factor: when many clients burst-send at the same time, the queue can fill faster
+than the receiver drains it. The retry schedule above then engages, and if the
+queue stays full past the attempt budget a message is dropped. Stream transports
+are unaffected, because they apply end-to-end backpressure instead of queueing.
+
+Raise the limit to widen the queue before deploying datagram transport at scale:
+
+```bash
+# Apply now
+sudo sysctl net.unix.max_dgram_qlen=512
+
+# Persist across reboots
+echo 'net.unix.max_dgram_qlen=512' | sudo tee /etc/sysctl.d/10-logfence.conf
+```
+
+A value of `512` comfortably absorbs bursts from a few hundred concurrent
+senders; size it to your expected peak fan-in.
+
 ---
 
 ## Configuration

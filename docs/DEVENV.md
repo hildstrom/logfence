@@ -193,6 +193,14 @@ cargo test -p logfence-daemon --test integration_test
 # Run a single integration test by name
 cargo test -p logfence-daemon --test integration_test -- max_connections_backpressure
 
+# Run ignored tests too (e.g. the 30 s SIGTERM drain-timeout test, which is
+# excluded from the default run because it waits the full SHUTDOWN_DRAIN_TIMEOUT)
+cargo test -p logfence-daemon --test integration_test -- --ignored
+
+# Run a single ignored test by name
+cargo test -p logfence-daemon --test integration_test \
+    -- --ignored sigterm_under_load_drain_timeout_forces_exit
+
 # Run throughput benchmarks (all groups)
 cargo bench -p logfence-daemon
 
