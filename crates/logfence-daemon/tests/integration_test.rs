@@ -115,7 +115,8 @@ impl Fixture {
         let config = format!(
             "[daemon]\nlisten_socket = \"{listen}\"\nsocket_mode = \"0600\"\n\
              max_connections = {max_connections}\n\
-             [rsyslog]\ntransport = \"unix_dgram\"\nsocket = \"{rsyslog}\"\n\n{extra}",
+             [rsyslog]\ntransport = \"unix_dgram\"\nsocket = \"{rsyslog}\"\n\
+             dgram_max_attempts = 100\n\n{extra}",
             listen = listen_path.display(),
             rsyslog = rsyslog_path.display(),
         );

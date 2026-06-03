@@ -105,13 +105,17 @@ impl Listener {
                 },
             };
 
-            let (stream, addr) = match listener.accept().await {
-                Ok(pair) => pair,
-                Err(e) => {
-                    error!(error = %e, "accept() failed");
-                    drop(permit);
-                    continue;
-                }
+            let (stream, addr) = tokio::select! {
+                biased;
+                () = shutdown.cancelled() => break,
+                result = listener.accept() => match result {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        error!(error = %e, "accept() failed");
+                        drop(permit);
+                        continue;
+                    }
+                },
             };
 
             let peer = addr
