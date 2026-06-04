@@ -137,9 +137,10 @@ retry schedule:
 |---------|----------------------|
 | 1 (immediate) | — |
 | 2 | 100 µs |
-| 3 | 500 µs |
-| 4 | 2 ms |
-| 5+ | 1 s each |
+| 3 | 200 µs |
+| 4 | 400 µs |
+| … | doubles each attempt |
+| 24+ | 1 s (cap) |
 
 Errors that are not buffer-full conditions (e.g. `ENOENT`, `EPERM`) are
 returned immediately without retrying.

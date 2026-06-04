@@ -44,9 +44,9 @@ socket = "/run/syslog"
 # 0 = unlimited (retry until the send succeeds or a non-retryable error occurs).
 # Default: 4
 #
-# Attempt 1 is immediate.  Attempts 2–4 use short exponential back-off
-# (100 µs → 500 µs → 2 ms).  Attempt 5 and above wait 1 s each, providing
-# strong backpressure when rsyslog is persistently slow.
+# Attempt 1 is immediate.  Attempt 2 waits 100 µs, and each subsequent
+# attempt doubles the delay until reaching the 1 s cap.  Attempts at or
+# above the cap wait 1 s each.
 # dgram_max_attempts = 4
 
 # What to do when all dgram_max_attempts attempts are exhausted.

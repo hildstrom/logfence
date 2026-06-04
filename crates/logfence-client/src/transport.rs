@@ -31,14 +31,14 @@ fn is_buffer_full(e: &std::io::Error) -> bool {
 }
 
 // Delay before the Nth attempt (1-indexed; no delay before attempt 1).
-// Attempts 2–4 use short exponential back-off; attempt 5+ uses 1 s.
+// Starts at 100 µs for attempt 2 and doubles each subsequent attempt,
+// capped at 1 s.
 fn dgram_attempt_delay(attempt: u32) -> Duration {
-    match attempt {
-        2 => Duration::from_micros(100),
-        3 => Duration::from_micros(500),
-        4 => Duration::from_millis(2),
-        _ => Duration::from_secs(1),
-    }
+    let max = Duration::from_secs(1);
+    let shift = attempt.saturating_sub(2);
+    let micros = 1u64.checked_shl(shift).map_or(u64::MAX, |v| 100u64.saturating_mul(v));
+    let delay = Duration::from_micros(micros);
+    if delay > max { max } else { delay }
 }
 
 // ── Transport trait ───────────────────────────────────────────────────────────
@@ -186,8 +186,8 @@ impl UnixDatagramTransport {
     /// Set the maximum number of datagram send attempts.
     ///
     /// `0` means unlimited — retry until the send succeeds or a non-retryable
-    /// error occurs.  Attempts 1–4 use a short exponential back-off (immediate
-    /// → 100 µs → 500 µs → 2 ms); attempt 5 and above wait 1 s each.
+    /// error occurs.  Attempt 1 is immediate; attempt 2 waits 100 µs, and
+    /// each subsequent attempt doubles the delay until reaching the 1 s cap.
     #[must_use]
     pub fn max_attempts(mut self, n: u32) -> Self {
         self.max_attempts = n;
