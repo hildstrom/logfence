@@ -732,8 +732,7 @@ fn bench_load_1x1000_dgram_dgram(c: &mut Criterion) {
 
     let setup = BenchSetup::start_dgram();
     let rt = tokio::runtime::Runtime::new().expect("build tokio runtime");
-    let transport =
-        UnixDatagramTransport::new(&setup.listen_path, 65_536).max_attempts(0);
+    let transport = UnixDatagramTransport::new(&setup.listen_path, 65_536).max_attempts(0);
 
     let baseline = setup.forwarded.load(Ordering::Relaxed);
     rt.block_on(async {
@@ -783,10 +782,7 @@ fn bench_load_4x250_dgram_dgram(c: &mut Criterion) {
     let setup = BenchSetup::start_dgram();
     let rt = tokio::runtime::Runtime::new().expect("build tokio runtime");
     let transports: Vec<UnixDatagramTransport> = (0..SENDERS)
-        .map(|_| {
-            UnixDatagramTransport::new(&setup.listen_path, 65_536)
-                .max_attempts(0)
-        })
+        .map(|_| UnixDatagramTransport::new(&setup.listen_path, 65_536).max_attempts(0))
         .collect();
 
     let baseline = setup.forwarded.load(Ordering::Relaxed);
@@ -841,10 +837,7 @@ fn bench_load_100x10_dgram_dgram(c: &mut Criterion) {
     let setup = BenchSetup::start_dgram();
     let rt = tokio::runtime::Runtime::new().expect("build tokio runtime");
     let transports: Vec<UnixDatagramTransport> = (0..SENDERS)
-        .map(|_| {
-            UnixDatagramTransport::new(&setup.listen_path, 65_536)
-                .max_attempts(0)
-        })
+        .map(|_| UnixDatagramTransport::new(&setup.listen_path, 65_536).max_attempts(0))
         .collect();
 
     let baseline = setup.forwarded.load(Ordering::Relaxed);
@@ -898,8 +891,7 @@ fn bench_load_1x1000_dgram_stream(c: &mut Criterion) {
 
     let mut setup = BenchSetup::start_dgram_stream();
     let rt = tokio::runtime::Runtime::new().expect("build tokio runtime");
-    let transport =
-        UnixDatagramTransport::new(&setup.listen_path, 65_536).max_attempts(0);
+    let transport = UnixDatagramTransport::new(&setup.listen_path, 65_536).max_attempts(0);
 
     setup.bytes_per_msg = measure_bytes_per_msg(&setup, || {
         rt.block_on(async {
@@ -949,10 +941,7 @@ fn bench_load_4x250_dgram_stream(c: &mut Criterion) {
     let mut setup = BenchSetup::start_dgram_stream();
     let rt = tokio::runtime::Runtime::new().expect("build tokio runtime");
     let transports: Vec<UnixDatagramTransport> = (0..SENDERS)
-        .map(|_| {
-            UnixDatagramTransport::new(&setup.listen_path, 65_536)
-                .max_attempts(0)
-        })
+        .map(|_| UnixDatagramTransport::new(&setup.listen_path, 65_536).max_attempts(0))
         .collect();
 
     setup.bytes_per_msg = measure_bytes_per_msg(&setup, || {
@@ -1018,10 +1007,7 @@ fn bench_load_100x10_dgram_stream(c: &mut Criterion) {
     let mut setup = BenchSetup::start_dgram_stream();
     let rt = tokio::runtime::Runtime::new().expect("build tokio runtime");
     let transports: Vec<UnixDatagramTransport> = (0..SENDERS)
-        .map(|_| {
-            UnixDatagramTransport::new(&setup.listen_path, 65_536)
-                .max_attempts(0)
-        })
+        .map(|_| UnixDatagramTransport::new(&setup.listen_path, 65_536).max_attempts(0))
         .collect();
 
     setup.bytes_per_msg = measure_bytes_per_msg(&setup, || {

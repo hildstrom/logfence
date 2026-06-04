@@ -51,9 +51,15 @@ fn is_buffer_full(e: &std::io::Error) -> bool {
 fn dgram_attempt_delay(attempt: u32) -> Duration {
     let max = Duration::from_secs(1);
     let shift = attempt.saturating_sub(2);
-    let micros = 1u64.checked_shl(shift).map_or(u64::MAX, |v| 100u64.saturating_mul(v));
+    let micros = 1u64
+        .checked_shl(shift)
+        .map_or(u64::MAX, |v| 100u64.saturating_mul(v));
     let delay = Duration::from_micros(micros);
-    if delay > max { max } else { delay }
+    if delay > max {
+        max
+    } else {
+        delay
+    }
 }
 
 // Send `data` to `path`, retrying on buffer-full errors up to `max_attempts`
