@@ -663,7 +663,10 @@ async fn cee_output_never_strips_cookie() {
 /// the `MessageBuilder` so we can supply unsorted JSON).
 async fn send_raw_json(listen_path: &std::path::PathBuf, json_body: &str) {
     let msg = SyslogMessage {
-        priority: Priority(Facility::Local0, Severity::Info),
+        priority: Priority {
+            facility: Facility::Local0,
+            severity: Severity::Info,
+        },
         timestamp: None,
         hostname: None,
         app_name: Some("itest".into()),

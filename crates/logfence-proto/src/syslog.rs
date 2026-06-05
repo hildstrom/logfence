@@ -136,7 +136,10 @@ impl Severity {
 
 /// Combined facility + severity, encoded as the RFC 5424 `PRI` integer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Priority(pub Facility, pub Severity);
+pub struct Priority {
+    pub facility: Facility,
+    pub severity: Severity,
+}
 
 impl Priority {
     /// Parse a priority from a raw `PRI` integer (0–191).
@@ -151,13 +154,13 @@ impl Priority {
         }
         let facility = Facility::from_integer(pri / 8)?;
         let severity = Severity::from_integer(pri % 8);
-        Ok(Self(facility, severity))
+        Ok(Self { facility, severity })
     }
 
     /// Encode as the RFC 5424 `PRIVAL` integer.
     #[must_use]
     pub fn as_integer(self) -> u8 {
-        (self.0 as u8) * 8 + (self.1 as u8)
+        (self.facility as u8) * 8 + (self.severity as u8)
     }
 }
 
@@ -667,8 +670,8 @@ mod tests {
     fn priority_local7_info() {
         // Local7 = 23, Info = 6 → PRI = 23*8+6 = 190
         let p = Priority::from_integer(190).unwrap();
-        assert_eq!(p.0, Facility::Local7);
-        assert_eq!(p.1, Severity::Info);
+        assert_eq!(p.facility, Facility::Local7);
+        assert_eq!(p.severity, Severity::Info);
         assert_eq!(p.as_integer(), 190);
     }
 

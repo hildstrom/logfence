@@ -12,7 +12,7 @@ name = "logfenced"
 path = "src/main.rs"
 
 [dependencies]
-logfence-proto = { path = "../logfence-proto" }
+logfence-proto = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true }
 jsonschema = { workspace = true }
@@ -28,8 +28,8 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 criterion         = { version = "0.8.2", features = ["html_reports"] }
-logfence-client   = { path = "../logfence-client" }
-logfence-client-c = { path = "../logfence-client-c" }
+logfence-client   = { workspace = true }
+logfence-client-c = { workspace = true }
 tempfile          = "3.27.0"
 tokio             = { workspace = true, features = ["time"] }
 

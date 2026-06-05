@@ -29,7 +29,7 @@
 //! # }
 //! ```
 //!
-//! [`logfenced`]: https://github.com/example/logfence
+//! [`logfenced`]: https://github.com/hildstrom/logfence
 
 pub mod builder;
 pub mod error;

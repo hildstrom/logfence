@@ -189,7 +189,10 @@ pub(crate) async fn report_rejection(
 ) {
     use logfence_proto::syslog::{Facility, Priority, Severity};
     let report = logfence_proto::syslog::SyslogMessage {
-        priority: Priority(Facility::Syslog, Severity::Warning),
+        priority: Priority {
+            facility: Facility::Syslog,
+            severity: Severity::Warning,
+        },
         timestamp: None,
         hostname: Some(local_hostname.to_owned()),
         app_name: Some("logfenced".to_owned()),
@@ -322,7 +325,10 @@ mod tests {
 
     fn sample_msg_wire() -> String {
         let msg = SyslogMessage {
-            priority: Priority(Facility::Local0, Severity::Info),
+            priority: Priority {
+                facility: Facility::Local0,
+                severity: Severity::Info,
+            },
             timestamp: None,
             hostname: None,
             app_name: Some("test".into()),
@@ -453,7 +459,10 @@ mod tests {
         let metrics = MetricsStore::new();
 
         let bad_msg = SyslogMessage {
-            priority: Priority(Facility::Local0, Severity::Info),
+            priority: Priority {
+                facility: Facility::Local0,
+                severity: Severity::Info,
+            },
             timestamp: None,
             hostname: None,
             app_name: None,
@@ -576,7 +585,10 @@ mod tests {
 
         // Message 1: {"event":"boot"} — passes Off-mode validator.
         let msg1 = SyslogMessage {
-            priority: Priority(Facility::Local0, Severity::Info),
+            priority: Priority {
+                facility: Facility::Local0,
+                severity: Severity::Info,
+            },
             timestamp: None,
             hostname: None,
             app_name: None,
@@ -644,7 +656,10 @@ mod tests {
         let metrics = MetricsStore::new();
 
         let msg = SyslogMessage {
-            priority: Priority(Facility::Local0, Severity::Info),
+            priority: Priority {
+                facility: Facility::Local0,
+                severity: Severity::Info,
+            },
             timestamp: None,
             hostname: None,
             app_name: None,
@@ -712,7 +727,10 @@ mod tests {
         let metrics = MetricsStore::new();
 
         let msg = SyslogMessage {
-            priority: Priority(Facility::Local0, Severity::Info),
+            priority: Priority {
+                facility: Facility::Local0,
+                severity: Severity::Info,
+            },
             timestamp: None,
             hostname: None,
             app_name: None,
@@ -761,7 +779,10 @@ mod tests {
         pid: Option<&str>,
     ) -> SyslogMessage {
         SyslogMessage {
-            priority: Priority(Facility::Local0, Severity::Info),
+            priority: Priority {
+                facility: Facility::Local0,
+                severity: Severity::Info,
+            },
             timestamp: None,
             hostname: hostname.map(str::to_owned),
             app_name: app.map(str::to_owned),

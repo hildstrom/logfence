@@ -173,7 +173,10 @@ impl MessageBuilder {
             json
         };
         Ok(SyslogMessage {
-            priority: Priority(self.facility, self.severity),
+            priority: Priority {
+                facility: self.facility,
+                severity: self.severity,
+            },
             timestamp: self.timestamp,
             hostname: self.hostname,
             app_name: self.app_name,

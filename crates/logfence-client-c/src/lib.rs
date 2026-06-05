@@ -272,7 +272,10 @@ fn cstr_to_opt(ptr: *const c_char) -> Option<String> {
 /// When `attr` is `NULL`, all optional header fields use their defaults
 /// (auto-timestamp, auto-PID, nil hostname/app-name/msg-id, no CEE prefix).
 fn build_msg(fac: Facility, sev: Severity, attr: *const LfMsgAttr, body: &str) -> SyslogMessage {
-    let priority = Priority(fac, sev);
+    let priority = Priority {
+        facility: fac,
+        severity: sev,
+    };
 
     let (ts_override, hostname, app_name, proc_id_override, msg_id, cee) = if attr.is_null() {
         (None, None, None, None, None, false)

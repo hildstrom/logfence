@@ -10,7 +10,8 @@ logfence/
 │                                     advisory checks, and crates.io-only source enforcement.
 ├── CLAUDE.md                         Project overview, goals, and AI-assisted development
 │                                     instructions. Target OS list and high-level design.
-├── LICENSE                           Apache 2.0 License.
+├── LICENSE-APACHE                    Apache License, Version 2.0.
+├── LICENSE-MIT                       MIT License.
 ├── README.md                         Project README: overview, quick start, and performance
 │                                     summary table.
 ├── get-rust.sh                       Convenience script that installs the Rust toolchain

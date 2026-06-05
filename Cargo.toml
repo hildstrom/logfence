@@ -13,8 +13,16 @@ edition = "2021"
 rust-version = "1.86"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/hildstrom/logfence"
+readme = "README.md"
+keywords = ["syslog", "logging", "rfc5424", "json", "validation"]
+categories = ["network-programming", "security"]
 
 [workspace.dependencies]
+# Internal crates (version pinned here; individual Cargo.toml files inherit via workspace = true)
+logfence-proto = { version = "0.1.0", path = "crates/logfence-proto" }
+logfence-client = { version = "0.1.0", path = "crates/logfence-client" }
+logfence-client-c = { version = "0.1.0", path = "crates/logfence-client-c" }
+
 # Async runtime
 tokio = { version = "1.52.3", features = ["net", "io-util", "sync", "rt-multi-thread", "macros", "signal"] }
 

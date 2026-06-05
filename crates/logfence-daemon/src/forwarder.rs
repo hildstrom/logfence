@@ -285,7 +285,10 @@ mod tests {
 
     fn sample_msg() -> SyslogMessage {
         SyslogMessage {
-            priority: Priority(Facility::Local0, Severity::Info),
+            priority: Priority {
+                facility: Facility::Local0,
+                severity: Severity::Info,
+            },
             timestamp: None,
             hostname: None,
             app_name: Some("test".into()),
