@@ -26,6 +26,8 @@ logfence/
 │   │   │                             logfence-client and logfence-daemon. Has no knowledge
 │   │   │                             of schemas, config, or application logic.
 │   │   ├── Cargo.toml
+│   │   ├── README.md                 Crate README for crates.io and GitHub: types,
+│   │   │                             codecs, and usage snippet.
 │   │   └── src/
 │   │       ├── lib.rs                Re-exports the two modules (syslog, frame).
 │   │       ├── syslog.rs             RFC 5424 types: Facility, Severity, Priority,
@@ -37,6 +39,8 @@ logfence/
 │   ├── logfence-client/              Application-facing client library. Depends on
 │   │   │                             logfence-proto. Does not depend on logfence-daemon.
 │   │   ├── Cargo.toml
+│   │   ├── README.md                 Crate README for crates.io and GitHub: MessageBuilder
+│   │   │                             API, stream and datagram examples, retry config.
 │   │   └── src/
 │   │       ├── lib.rs                Re-exports the public API modules.
 │   │       ├── builder.rs            MessageBuilder fluent API — assembles a SyslogMessage
@@ -54,6 +58,9 @@ logfence/
 │   │   ├── Cargo.toml                Package manifest with explicit lint table
 │   │   │                             (does not inherit workspace lints — unsafe_code
 │   │   │                             must be allowed at the FFI boundary).
+│   │   ├── README.md                 Crate README for crates.io and GitHub: C API
+│   │   │                             functions, build/link instructions, C example,
+│   │   │                             thread safety, and error codes.
 │   │   ├── include/
 │   │   │   └── logfence.h            Hand-written C header. Declares LfClient (opaque
 │   │   │                             handle), LfMsgAttr (optional header attributes),
@@ -75,6 +82,8 @@ logfence/
 │   │
 │   └── logfence-daemon/              The logfenced binary. Depends on logfence-proto.
 │       ├── Cargo.toml
+│       ├── README.md                 Crate README for crates.io and GitHub: features,
+│       │                             install, config, signals, platforms, performance.
 │       ├── src/
 │       │   ├── main.rs               Entry point: clap CLI, file-aware logging setup,
 │       │   │                         schema loading, signal handling (SIGTERM/SIGHUP/

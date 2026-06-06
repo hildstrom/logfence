@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
 
 [lib]
 # rlib is required for use as a Rust dependency (e.g. integration tests).

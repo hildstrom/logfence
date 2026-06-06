@@ -57,10 +57,10 @@ logfence is composed of four crates:
 
 | Crate | Role |
 |---|---|
-| `logfence-proto` | RFC 5424 types (`SyslogMessage`, `Facility`, `Severity`) and framing codecs (`OctetCountCodec`, `DelimiterCodec`) |
-| `logfence-client` | `MessageBuilder` fluent API, `UnixTransport` (stream), and `UnixDatagramTransport` for applications sending structured log messages |
-| `logfence-client-c` | Simple `logfence-client` C API wrapper for C applications sending structured log messages |
-| `logfence-daemon` | The `logfenced` daemon: config, validation, forwarding, metrics, signal handling |
+| [`logfence-proto`](crates/logfence-proto/) | RFC 5424 types (`SyslogMessage`, `Facility`, `Severity`) and framing codecs (`OctetCountCodec`, `DelimiterCodec`) |
+| [`logfence-client`](crates/logfence-client/) | `MessageBuilder` fluent API, `UnixTransport` (stream), and `UnixDatagramTransport` for applications sending structured log messages |
+| [`logfence-client-c`](crates/logfence-client-c/) | Simple `logfence-client` C API wrapper for C applications sending structured log messages |
+| [`logfence-daemon`](crates/logfence-daemon/) | The `logfenced` daemon: config, validation, forwarding, metrics, signal handling |
 
 See [docs/diagrams/README.md](docs/diagrams/README.md) for architecture
 diagrams covering system context, crate dependencies, daemon module
