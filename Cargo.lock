@@ -698,7 +698,7 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "logfence-client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "logfence-proto",
  "serde",
@@ -711,7 +711,7 @@ dependencies = [
 
 [[package]]
 name = "logfence-client-c"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "logfence-client",
  "logfence-proto",
@@ -722,7 +722,7 @@ dependencies = [
 
 [[package]]
 name = "logfence-daemon"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "clap",
@@ -745,7 +745,7 @@ dependencies = [
 
 [[package]]
 name = "logfence-proto"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "thiserror",
